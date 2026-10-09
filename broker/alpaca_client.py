@@ -129,8 +129,11 @@ class AlpacaPaperClient:
                 message="Simulated order accepted in dry-run mode."
             )
 
-        # 1. Buy Order with Stop-Loss
+        # 1. Buy Order with Stop-Loss & Take-Profit (Bracket)
         if directive.side == OrderSide.BUY:
+            stop_dist = max(0.5, directive.limit_price - directive.stop_loss_price)
+            take_profit_price = round(directive.limit_price + (2.5 * stop_dist), 2)
+
             payload = {
                 "symbol": directive.ticker,
                 "qty": str(directive.shares),
@@ -138,12 +141,29 @@ class AlpacaPaperClient:
                 "type": "market",
                 "time_in_force": "day",
                 "order_class": "bracket",
+                "take_profit": {
+                    "limit_price": str(take_profit_price)
+                },
                 "stop_loss": {
                     "stop_price": str(directive.stop_loss_price)
                 }
             }
 
             resp = self.session.post(f"{self.base_url}/v2/orders", json=payload, timeout=10)
+            if resp.status_code not in (200, 201):
+                # Fallback to OTO (One-Triggers-Other) with stop-loss only if bracket is rejected
+                payload_oto = {
+                    "symbol": directive.ticker,
+                    "qty": str(directive.shares),
+                    "side": "buy",
+                    "type": "market",
+                    "time_in_force": "day",
+                    "order_class": "oto",
+                    "stop_loss": {
+                        "stop_price": str(directive.stop_loss_price)
+                    }
+                }
+                resp = self.session.post(f"{self.base_url}/v2/orders", json=payload_oto, timeout=10)
             if resp.status_code in (200, 201):
                 res_data = resp.json()
                 return ExecutionResult(
