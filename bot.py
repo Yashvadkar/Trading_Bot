@@ -275,6 +275,9 @@ class TradingBot:
 
             if directive.is_authorized:
                 authorized_count += 1
+                if len(directive.child_slices) > 1:
+                    print(f"[Almgren-Chriss] Sliced parent order of {directive.shares} shares into {len(directive.child_slices)} TWAP/POV blocks: {directive.child_slices}")
+
                 print(
                     f"[Risk Governor: APPROVED] {directive.side.value.upper()} {directive.shares} shares of {directive.ticker} "
                     f"at ~${directive.limit_price:.2f} (Stop Loss: ${directive.stop_loss_price:.2f}, Capital: ${directive.dollar_allocation:,.2f})"
@@ -284,6 +287,7 @@ class TradingBot:
                 res = self.broker.submit_order(directive)
                 if res.success:
                     executed_count += 1
+                    self.governor.otr_tracker.record_trade()
                     print(f"[Broker: SUCCESS] {res.message} (Order ID: {res.order_id})")
                     self.ledger.log_trade(TradeRecord(
                         ticker=directive.ticker,

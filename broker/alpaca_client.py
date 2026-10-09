@@ -6,6 +6,7 @@ Features automatic retries, dry-run safety modes, and response parsing.
 
 from __future__ import annotations
 import json
+import uuid
 from dataclasses import dataclass
 import requests
 from config import Config
@@ -156,8 +157,24 @@ class AlpacaPaperClient:
         except Exception:
             return False
 
+    def get_order_by_client_id(self, client_order_id: str) -> dict | None:
+        """Deterministically query an order by client_order_id for replay safety."""
+        if self.dry_run:
+            return {"id": client_order_id, "status": "accepted"}
+        try:
+            resp = self.session.get(
+                f"{self.base_url}/v2/orders:by_client_order_id",
+                params={"client_order_id": client_order_id},
+                timeout=8
+            )
+            if resp.status_code == 200:
+                return resp.json()
+            return None
+        except Exception:
+            return None
+
     def submit_order(self, directive: OrderDirective) -> ExecutionResult:
-        """Submit a validated order directive to the broker."""
+        """Submit a validated order directive to the broker with deterministic idempotency."""
         if not directive.is_authorized:
             return ExecutionResult(
                 success=False,
@@ -169,15 +186,17 @@ class AlpacaPaperClient:
                 message=f"Order rejected by risk governor: {directive.rejection_reason}"
             )
 
+        client_order_id = f"bot_{uuid.uuid4().hex[:16]}"
+
         if self.dry_run:
             return ExecutionResult(
                 success=True,
-                order_id=f"SIM_{directive.ticker}_{directive.shares}",
+                order_id=f"SIM_{directive.ticker}_{directive.shares}_{client_order_id[:8]}",
                 ticker=directive.ticker,
                 side=directive.side.value,
                 shares=directive.shares,
                 filled_price=directive.limit_price,
-                message="Simulated order accepted in dry-run mode."
+                message=f"Simulated order accepted in dry-run mode (idempotency key: {client_order_id})."
             )
 
         # 1. Buy Order with Stop-Loss & Take-Profit (Bracket)
@@ -192,6 +211,7 @@ class AlpacaPaperClient:
                 "type": "market",
                 "time_in_force": "day",
                 "order_class": "bracket",
+                "client_order_id": client_order_id,
                 "take_profit": {
                     "limit_price": str(take_profit_price)
                 },
@@ -200,41 +220,67 @@ class AlpacaPaperClient:
                 }
             }
 
-            resp = self.session.post(f"{self.base_url}/v2/orders", json=payload, timeout=10)
-            if resp.status_code not in (200, 201):
-                # Fallback to OTO (One-Triggers-Other) with stop-loss only if bracket is rejected
-                payload_oto = {
-                    "symbol": directive.ticker,
-                    "qty": str(directive.shares),
-                    "side": "buy",
-                    "type": "market",
-                    "time_in_force": "day",
-                    "order_class": "oto",
-                    "stop_loss": {
-                        "stop_price": str(directive.stop_loss_price)
+            try:
+                resp = self.session.post(f"{self.base_url}/v2/orders", json=payload, timeout=10)
+                if resp.status_code not in (200, 201):
+                    # Fallback to OTO (One-Triggers-Other) with stop-loss only if bracket is rejected
+                    payload_oto = {
+                        "symbol": directive.ticker,
+                        "qty": str(directive.shares),
+                        "side": "buy",
+                        "type": "market",
+                        "time_in_force": "day",
+                        "order_class": "oto",
+                        "client_order_id": client_order_id,
+                        "stop_loss": {
+                            "stop_price": str(directive.stop_loss_price)
+                        }
                     }
-                }
-                resp = self.session.post(f"{self.base_url}/v2/orders", json=payload_oto, timeout=10)
-            if resp.status_code in (200, 201):
-                res_data = resp.json()
-                return ExecutionResult(
-                    success=True,
-                    order_id=res_data.get("id"),
-                    ticker=directive.ticker,
-                    side="buy",
-                    shares=directive.shares,
-                    filled_price=directive.limit_price,
-                    message="Bracket buy order successfully submitted to Alpaca."
-                )
-            else:
+                    resp = self.session.post(f"{self.base_url}/v2/orders", json=payload_oto, timeout=10)
+
+                if resp.status_code in (200, 201):
+                    res_data = resp.json()
+                    return ExecutionResult(
+                        success=True,
+                        order_id=res_data.get("id"),
+                        ticker=directive.ticker,
+                        side="buy",
+                        shares=directive.shares,
+                        filled_price=directive.limit_price,
+                        message=f"Bracket buy order submitted to Alpaca (Key: {client_order_id})."
+                    )
+                else:
+                    return ExecutionResult(
+                        success=False,
+                        order_id=None,
+                        ticker=directive.ticker,
+                        side="buy",
+                        shares=directive.shares,
+                        filled_price=directive.limit_price,
+                        message=f"Alpaca API error: {resp.status_code} - {resp.text}"
+                    )
+            except (requests.Timeout, requests.RequestException) as net_err:
+                # Deterministic timeout reconciliation: query by client_order_id
+                print(f"[Alpaca Gateway] Network partition/timeout on {client_order_id}. Reconciling exchange state...")
+                reconciled = self.get_order_by_client_id(client_order_id)
+                if reconciled and reconciled.get("status") in ("accepted", "new", "partially_filled", "filled", "pending_new"):
+                    return ExecutionResult(
+                        success=True,
+                        order_id=reconciled.get("id"),
+                        ticker=directive.ticker,
+                        side="buy",
+                        shares=directive.shares,
+                        filled_price=directive.limit_price,
+                        message=f"Order reconciled via client_order_id ({client_order_id}) after network timeout."
+                    )
                 return ExecutionResult(
                     success=False,
                     order_id=None,
                     ticker=directive.ticker,
                     side="buy",
-                    shares=directive.shares,
-                    filled_price=directive.limit_price,
-                    message=f"Alpaca API error: {resp.status_code} - {resp.text}"
+                    shares=0,
+                    filled_price=0.0,
+                    message=f"Order timed out and was not confirmed at exchange boundary: {net_err}"
                 )
 
         # 2. Sell / Close Order

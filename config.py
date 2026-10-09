@@ -39,6 +39,11 @@ class RiskConfig:
     min_market_cap_usd: float = 500_000_000.0  # $500M market cap floor
     min_avg_daily_volume_usd: float = 10_000_000.0  # $10M ADV floor
     min_stock_price: float = 5.0           # $5 price floor
+    kelly_fraction: float = 0.15           # Fractional Kelly scaling parameter kappa (0.15)
+    max_leverage: float = 1.5              # Maximum gross portfolio leverage ceiling
+    otr_soft_threshold: float = 35.0       # Soft OTR limit to throttle cancellations
+    otr_kill_threshold: float = 45.0       # Hard OTR limit to engage regulatory kill-switch
+    otr_window_seconds: int = 86400        # Rolling window in seconds (24h)
 
 
 @dataclass(frozen=True)

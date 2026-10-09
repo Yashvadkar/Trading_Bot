@@ -113,7 +113,7 @@ class QuantTheoryEngine:
         # Rescale diagonals to strictly 1.0
         d = np.sqrt(np.diag(cleaned_corr))
         d_outer = np.outer(d, d)
-        cleaned_corr = np.divide(cleaned_corr, d_outer, where=(d_outer > 0))
+        cleaned_corr = np.divide(cleaned_corr, d_outer, out=np.zeros_like(cleaned_corr), where=(d_outer > 0))
         np.fill_diagonal(cleaned_corr, 1.0)
 
         noise_ratio = float(np.sum(is_noise)) / float(N)
@@ -505,7 +505,65 @@ class QuantTheoryEngine:
         return float(np.clip(topological_entropy, 0.0, 1.0)), float(np.clip(w_dist * 50.0, 0.0, 3.0))
 
     # =========================================================================
-    # 9. Extreme Learning Machine (ELM) — Liquid Reservoir Projection
+    # 9. Microstructure Alpha — Cumulative Volume Delta (CVD) & Absorption
+    # =========================================================================
+    @staticmethod
+    def compute_cumulative_volume_delta(
+        highs: np.ndarray,
+        lows: np.ndarray,
+        closes: np.ndarray,
+        volumes: np.ndarray
+    ) -> tuple[float, float]:
+        """Calculates Cumulative Volume Delta (CVD) and Absorption Divergence.
+        
+        Uses the Lee-Ready / tick range proxy to classify taker buy vs sell volume:
+            q_t = (Close - Low) / (High - Low + 1e-6)  # Taker buy fraction [0, 1]
+            Delta_V_t = (2 * q_t - 1) * Volume_t
+            
+        Returns:
+            (normalized_cvd, absorption_divergence_signal)
+            absorption_divergence: -1.0 (bearish absorption / selling into highs),
+                                  +1.0 (bullish exhaustion / buying into lows),
+                                   0.0 (aligned)
+        """
+        h = np.asarray(highs, dtype=np.float64)
+        l = np.asarray(lows, dtype=np.float64)
+        c = np.asarray(closes, dtype=np.float64)
+        v = np.asarray(volumes, dtype=np.float64)
+        L = min(len(h), len(l), len(c), len(v))
+        if L < 5:
+            return 0.0, 0.0
+
+        h, l, c, v = h[-L:], l[-L:], c[-L:], v[-L:]
+        price_range = np.maximum(h - l, 1e-6)
+        buy_fractions = (c - l) / price_range
+        taker_deltas = (2.0 * buy_fractions - 1.0) * v
+        cvd_series = np.cumsum(taker_deltas)
+
+        # Normalized net CVD over window
+        total_vol = max(np.sum(v), 1.0)
+        norm_cvd = float(np.clip(cvd_series[-1] / total_vol, -1.0, 1.0))
+
+        # Divergence detection over last 10 bars
+        if L >= 10:
+            price_slope = float(c[-1] - c[-10]) / max(c[-10], 1e-4)
+            cvd_slope = float(cvd_series[-1] - cvd_series[-10]) / total_vol
+
+            # Bearish divergence: price rising but taker delta falling (passive absorption)
+            if price_slope > 0.01 and cvd_slope < -0.05:
+                divergence = -1.0
+            # Bullish divergence: price falling but taker delta rising (passive accumulation)
+            elif price_slope < -0.01 and cvd_slope > 0.05:
+                divergence = 1.0
+            else:
+                divergence = 0.0
+        else:
+            divergence = 0.0
+
+        return norm_cvd, divergence
+
+    # =========================================================================
+    # 10. Extreme Learning Machine (ELM) — Liquid Reservoir Projection
     # =========================================================================
     def project_elm_reservoir(self, raw_technicals: np.ndarray) -> np.ndarray:
         """Projects 8 raw technical features into a 16-dimensional non-linear liquid state.
