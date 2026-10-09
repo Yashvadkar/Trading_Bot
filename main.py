@@ -1,7 +1,8 @@
 """CLI Entrypoint for the Neuro-Symbolic Trading Bot.
 
-Usage:
-    python main.py --mode paper --cycles 1
+Supports:
+    python main.py --mode paper --cycles 5
+    python main.py --daemon
     python main.py --dry-run
     python main.py --status
     python main.py --discover
@@ -9,11 +10,12 @@ Usage:
 
 from __future__ import annotations
 import argparse
+import signal
 import sys
 import time
-from config import load_config
+from config import load_config, Config
 from bot import TradingBot
-from broker.alpaca_client import AlpacaPaperClient
+from broker.alpaca_client import AlpacaPaperClient, MarketClock
 from broker.ledger import TradeLedger
 from discovery.scout import DiscoveryScout
 
@@ -22,8 +24,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Hybrid Agent-Reach + Multi-Neural-Network Debate Trading Bot")
     parser.add_argument("--mode", choices=["paper", "dry-run"], default="paper", help="Execution mode (default: paper)")
     parser.add_argument("--dry-run", action="store_true", help="Shortcut for --mode dry-run (simulation without real orders)")
-    parser.add_argument("--cycles", type=int, default=1, help="Number of autonomous scanning cycles to run (default: 1)")
-    parser.add_argument("--interval", type=int, default=60, help="Seconds to sleep between cycles if cycles > 1 (default: 60)")
+    parser.add_argument("--daemon", action="store_true", help="Run 24/7 continuous autonomous loop with market clock awareness")
+    parser.add_argument("--continuous", action="store_true", help="Alias for --daemon")
+    parser.add_argument("--cycles", type=int, default=1, help="Number of autonomous scanning cycles to run if not in daemon mode (default: 1)")
+    parser.add_argument("--interval", type=int, default=60, help="Seconds to sleep between cycles (default: 60)")
     parser.add_argument("--status", action="store_true", help="Display account equity, positions, and recent trades")
     parser.add_argument("--discover", action="store_true", help="Scan internet feeds for stocks without trading")
     return parser.parse_args()
@@ -39,11 +43,13 @@ def display_status() -> None:
     print("=" * 55)
     try:
         acc = client.get_account()
+        clock: MarketClock = client.get_market_clock()
         print(f"Status:        {acc.status}")
         print(f"Paper Trading: {acc.is_paper}")
         print(f"Total Equity:  ${acc.equity:,.2f}")
         print(f"Cash Balance:  ${acc.cash:,.2f}")
         print(f"Buying Power:  ${acc.buying_power:,.2f}")
+        print(f"Market Open:   {clock.is_open} (Next Open: {clock.next_open})")
     except Exception as e:
         print(f"Failed to query Alpaca API: {e}")
 
@@ -82,6 +88,62 @@ def display_discovery() -> None:
     print()
 
 
+def run_daemon_loop(bot: TradingBot, config: Config, interval: int) -> None:
+    """Continuous 24/7 loop with market hours awareness and graceful signal handling."""
+    stop_requested = False
+
+    def handle_signal(sig, frame):
+        nonlocal stop_requested
+        print("\n[Daemon] Graceful shutdown requested (Ctrl+C). Finishing current loop...")
+        stop_requested = True
+
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+
+    print("\n" + "#" * 65)
+    print("  STARTING 24/7 AUTONOMOUS DAEMON TRADING ENGINE")
+    print("  Active Scanning Interval: " + str(interval) + "s")
+    print("  Press Ctrl+C to stop safely at any time.")
+    print("#" * 65 + "\n")
+
+    cycle_count = 0
+    trained_off_hours_today = False
+
+    while not stop_requested:
+        cycle_count += 1
+        clock: MarketClock = bot.broker.get_market_clock()
+
+        if clock.is_open:
+            trained_off_hours_today = False  # Reset for next close
+            print(f"\n[Daemon] Market is OPEN. Executing Cycle #{cycle_count}...")
+            bot.run_cycle()
+
+            # Sleep between cycles during market hours
+            sleep_remaining = interval
+            while sleep_remaining > 0 and not stop_requested:
+                step = min(1, sleep_remaining)
+                time.sleep(step)
+                sleep_remaining -= step
+        else:
+            print(f"\n[Daemon] Market is CLOSED. (Next Open: {clock.next_open})")
+            if not trained_off_hours_today and len(bot.buffer) >= bot.config.model.batch_size:
+                print("[Daemon: Off-Hours] Executing post-market neural co-training update...")
+                metrics = bot.trainer.train_step(bot.buffer, batch_size=bot.config.model.batch_size)
+                print(f"[Daemon: Off-Hours] Training step completed | Bull Loss: {metrics.bull_loss:.4f} | Bear Loss: {metrics.bear_loss:.4f}")
+                trained_off_hours_today = True
+
+            # Standby sleep during off hours
+            standby_seconds = min(config.daemon.off_hours_sleep, 300)
+            print(f"[Daemon] Entering standby sleep ({standby_seconds}s)...")
+            sleep_remaining = standby_seconds
+            while sleep_remaining > 0 and not stop_requested:
+                step = min(2, sleep_remaining)
+                time.sleep(step)
+                sleep_remaining -= step
+
+    print("[Daemon] Clean shutdown complete. Final telemetry saved to SQLite ledger.")
+
+
 def main() -> None:
     args = parse_args()
 
@@ -99,12 +161,15 @@ def main() -> None:
 
     bot = TradingBot(config=config, dry_run=is_dry_run)
 
-    for i in range(args.cycles):
-        print(f"\n>>> Running Autonomous Cycle {i + 1} of {args.cycles} <<<")
-        bot.run_cycle()
-        if i < args.cycles - 1:
-            print(f"Sleeping {args.interval}s until next cycle...")
-            time.sleep(args.interval)
+    if args.daemon or args.continuous:
+        run_daemon_loop(bot, config, args.interval)
+    else:
+        for i in range(args.cycles):
+            print(f"\n>>> Running Autonomous Cycle {i + 1} of {args.cycles} <<<")
+            bot.run_cycle()
+            if i < args.cycles - 1:
+                print(f"Sleeping {args.interval}s until next cycle...")
+                time.sleep(args.interval)
 
 
 if __name__ == "__main__":

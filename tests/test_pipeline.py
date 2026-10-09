@@ -35,7 +35,8 @@ from model.debate import DebateArena
 from model.replay_buffer import ReplayBuffer
 from model.trainer import EnsembleTrainer
 from risk.circuit_breaker import CircuitBreaker, BreakerStatus
-from risk.governor import RiskGovernor, OrderSide
+from risk.governor import RiskGovernor, OrderSide, PositionActionType, PositionDirective
+from broker.alpaca_client import AlpacaPaperClient, MarketClock
 from broker.ledger import TradeLedger, TradeRecord
 
 
@@ -193,6 +194,59 @@ class TestTradingBotPipeline(unittest.TestCase):
                 db_path.unlink(missing_ok=True)
             except Exception:
                 pass
+
+    def test_market_clock_telemetry(self):
+        cfg = load_config()
+        client = AlpacaPaperClient(cfg, dry_run=True)
+        clock = client.get_market_clock()
+        self.assertIsInstance(clock, MarketClock)
+        self.assertTrue(clock.is_open)
+
+    def test_position_monitor_and_ratchet_stop(self):
+        cfg = RiskConfig(atr_multiplier_stop=2.0)
+        gov = RiskGovernor(cfg)
+
+        # 1. Test Neural Exit (Action 3: EXIT)
+        exit_dir = gov.evaluate_held_position(
+            ticker="NVDA",
+            shares=100,
+            entry_price=100.0,
+            current_price=102.0,
+            atr=4.0,
+            unrealized_pnl_pct=0.02,
+            debate_action=3, # EXIT
+            current_stop_price=92.0
+        )
+        self.assertEqual(exit_dir.action_type, PositionActionType.EXIT)
+        self.assertIn("EXIT signal", exit_dir.reason)
+
+        # 2. Test Ratchet Stop on +8% gain (Stop raised above entry to lock profit)
+        ratchet_dir = gov.evaluate_held_position(
+            ticker="NVDA",
+            shares=100,
+            entry_price=100.0,
+            current_price=108.0,
+            atr=3.0,
+            unrealized_pnl_pct=0.08,
+            debate_action=0, # HOLD
+            current_stop_price=94.0 # Old stop below entry
+        )
+        self.assertEqual(ratchet_dir.action_type, PositionActionType.UPDATE_STOP)
+        self.assertTrue(ratchet_dir.new_stop_price > 100.0) # Stop raised ABOVE entry!
+        self.assertIn("Profit lock ratcheted", ratchet_dir.reason)
+
+        # 3. Test Normal Hold when flat (+0.5%)
+        hold_dir = gov.evaluate_held_position(
+            ticker="NVDA",
+            shares=100,
+            entry_price=100.0,
+            current_price=100.5,
+            atr=3.0,
+            unrealized_pnl_pct=0.005,
+            debate_action=0,
+            current_stop_price=94.0
+        )
+        self.assertEqual(hold_dir.action_type, PositionActionType.HOLD)
 
 
 if __name__ == "__main__":

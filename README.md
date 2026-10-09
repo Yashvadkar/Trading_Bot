@@ -92,13 +92,21 @@ python main.py --discover
 python main.py --dry-run
 ```
 
-### 5. Run Continuous Paper Trading
+### 5. Run 24/7 Autonomous Daemon Mode (Recommended)
+Runs an infinite continuous loop with automatic US market clock awareness, active position management, and off-hours neural training:
+```bash
+python main.py --daemon
+# Optional: customize scan interval (e.g. 60 seconds)
+python main.py --daemon --interval 60
+```
+
+### 6. Run Fixed-Cycle Paper Trading
 ```bash
 # Run 5 consecutive cycles with 60s scan interval
 python main.py --mode paper --cycles 5 --interval 60
 ```
 
-### 6. Run Unit & Regression Test Suite
+### 7. Run Unit & Regression Test Suite
 ```bash
 python -m unittest discover -s tests -p "test_*.py" -v
 ```

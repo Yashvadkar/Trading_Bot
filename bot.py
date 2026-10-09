@@ -24,7 +24,7 @@ from model.replay_buffer import ReplayBuffer
 from model.trainer import EnsembleTrainer
 from model.pretrain import run_pretraining
 from risk.circuit_breaker import CircuitBreaker, BreakerStatus
-from risk.governor import RiskGovernor, OrderDirective, OrderSide
+from risk.governor import RiskGovernor, OrderDirective, OrderSide, PositionDirective, PositionActionType
 from broker.alpaca_client import AlpacaPaperClient, AccountStatus, PositionInfo
 from broker.ledger import TradeLedger, TradeRecord
 
@@ -117,6 +117,64 @@ class TradingBot:
                     is_authorized=True
                 ))
             return CycleSummary(start_time, 0, 0, 0, 0, breaker_state.status.value, account.equity)
+
+        # 1.5 Active Position Management (Monitor currently open positions)
+        if positions:
+            print(f"[Position Monitor] Actively managing {len(positions)} open positions...")
+            for pos in positions:
+                stock_data = self.screener.screen_ticker(pos.ticker)
+                if stock_data:
+                    port_ctx = PortfolioContext(
+                        cash_ratio=(account.cash / account.equity) if account.equity > 0 else 1.0,
+                        current_stock_weight=(pos.market_value / account.equity) if account.equity > 0 else 0.0,
+                        unrealized_pnl_pct=pos.unrealized_pnl_pct,
+                        daily_drawdown_pct=breaker_state.daily_drawdown_pct
+                    )
+                    s_tensor = self.normalizer.build_state_vector(
+                        stock_data.technicals,
+                        SentimentMetrics(),
+                        stock_data.fundamentals,
+                        stock_data.microstructure,
+                        port_ctx,
+                        DebateMetrics()
+                    )
+                    v_pos = self.arena.evaluate_debate(s_tensor)
+
+                    entry_px = pos.current_price / (1.0 + pos.unrealized_pnl_pct) if (1.0 + pos.unrealized_pnl_pct) > 0 else pos.current_price
+                    base_stop = max(0.01, entry_px - 2.0 * stock_data.technicals.atr)
+
+                    pos_directive = self.governor.evaluate_held_position(
+                        ticker=pos.ticker,
+                        shares=pos.shares,
+                        entry_price=entry_px,
+                        current_price=pos.current_price,
+                        atr=stock_data.technicals.atr,
+                        unrealized_pnl_pct=pos.unrealized_pnl_pct,
+                        debate_action=v_pos.chosen_action,
+                        current_stop_price=base_stop
+                    )
+
+                    if pos_directive.action_type == PositionActionType.EXIT:
+                        print(f"[Position Monitor: EXIT TRIGGERED] {pos.ticker} - {pos_directive.reason}")
+                        exit_res = self.broker.submit_order(OrderDirective(
+                            ticker=pos.ticker,
+                            side=OrderSide.SELL,
+                            shares=0,
+                            limit_price=pos.current_price,
+                            stop_loss_price=0.0,
+                            dollar_allocation=0.0,
+                            risk_pct_actual=0.0,
+                            is_authorized=True
+                        ))
+                        if exit_res.success:
+                            print(f"[Broker: EXIT SUCCESS] Closed position in {pos.ticker}")
+                    elif pos_directive.action_type == PositionActionType.UPDATE_STOP:
+                        print(f"[Position Monitor: RATCHET STOP] {pos.ticker} - {pos_directive.reason}")
+                        updated = self.broker.update_stop_loss(pos.ticker, pos_directive.new_stop_price)
+                        if updated:
+                            print(f"[Broker: STOP UPDATED] {pos.ticker} stop ratcheted to ${pos_directive.new_stop_price:.2f}")
+                    else:
+                        print(f"[Position Monitor: HOLD] {pos.ticker} ({pos.shares} shs @ ${pos.current_price:.2f}, PnL: {pos.unrealized_pnl_pct*100:+.2f}%)")
 
         # 2. Open-Ended Internet Discovery (agent-reach / RSS)
         print("[Discovery] Scanning financial feeds and market news for high-conviction catalysts...")

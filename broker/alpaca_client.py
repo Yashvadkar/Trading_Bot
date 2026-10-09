@@ -43,6 +43,14 @@ class ExecutionResult:
     message: str
 
 
+@dataclass(frozen=True)
+class MarketClock:
+    timestamp: str
+    is_open: bool
+    next_open: str
+    next_close: str
+
+
 class AlpacaPaperClient:
     """REST Client for Alpaca Paper Trading API."""
 
@@ -104,6 +112,49 @@ class AlpacaPaperClient:
                 unrealized_pnl_pct=float(p.get("unrealized_plpc", 0.0)),
             ))
         return positions
+
+    def get_market_clock(self) -> MarketClock:
+        """Fetch US market open/close clock telemetry from Alpaca."""
+        if self.dry_run:
+            return MarketClock(
+                timestamp="2026-10-09T09:30:00Z",
+                is_open=True,
+                next_open="2026-10-10T09:30:00Z",
+                next_close="2026-10-09T16:00:00Z"
+            )
+        try:
+            resp = self.session.get(f"{self.base_url}/v2/clock", timeout=8)
+            resp.raise_for_status()
+            data = resp.json()
+            return MarketClock(
+                timestamp=str(data.get("timestamp", "")),
+                is_open=bool(data.get("is_open", False)),
+                next_open=str(data.get("next_open", "")),
+                next_close=str(data.get("next_close", ""))
+            )
+        except Exception:
+            return MarketClock(timestamp="", is_open=True, next_open="", next_close="")
+
+    def update_stop_loss(self, ticker: str, new_stop_price: float) -> bool:
+        """Finds open stop order for ticker and patches the stop price upward."""
+        if self.dry_run:
+            return True
+        try:
+            resp = self.session.get(f"{self.base_url}/v2/orders?status=open&symbols={ticker}", timeout=8)
+            if resp.status_code == 200:
+                orders = resp.json()
+                for ord_info in orders:
+                    if ord_info.get("type") in ("stop", "stop_limit") or ord_info.get("stop_price"):
+                        order_id = ord_info.get("id")
+                        patch_resp = self.session.patch(
+                            f"{self.base_url}/v2/orders/{order_id}",
+                            json={"stop_price": str(new_stop_price)},
+                            timeout=8
+                        )
+                        return patch_resp.status_code in (200, 201)
+            return False
+        except Exception:
+            return False
 
     def submit_order(self, directive: OrderDirective) -> ExecutionResult:
         """Submit a validated order directive to the broker."""

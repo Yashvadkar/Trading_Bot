@@ -19,6 +19,12 @@ class OrderSide(str, Enum):
     HOLD = "hold"
 
 
+class PositionActionType(str, Enum):
+    HOLD = "hold"
+    EXIT = "exit"
+    UPDATE_STOP = "update_stop"
+
+
 @dataclass(frozen=True)
 class OrderDirective:
     ticker: str
@@ -30,6 +36,17 @@ class OrderDirective:
     risk_pct_actual: float
     is_authorized: bool
     rejection_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class PositionDirective:
+    ticker: str
+    action_type: PositionActionType
+    current_price: float
+    new_stop_price: float
+    shares: int
+    unrealized_pnl_pct: float
+    reason: str
 
 
 class RiskGovernor:
@@ -187,4 +204,57 @@ class RiskGovernor:
             risk_pct_actual=round(actual_risk_pct, 4),
             is_authorized=True,
             rejection_reason=None
+        )
+
+    def evaluate_held_position(
+        self,
+        ticker: str,
+        shares: int,
+        entry_price: float,
+        current_price: float,
+        atr: float,
+        unrealized_pnl_pct: float,
+        debate_action: int,        # 0: Hold, 1: Buy 0.5x, 2: Buy 1.0x, 3: Exit
+        current_stop_price: float
+    ) -> PositionDirective:
+        """Evaluates an existing held position for neural early-exit or ratchet trailing stops."""
+        # 1. Neural Exit: If Bear network or consensus decides EXIT (3), close immediately
+        if debate_action == 3:
+            return PositionDirective(
+                ticker=ticker,
+                action_type=PositionActionType.EXIT,
+                current_price=current_price,
+                new_stop_price=0.0,
+                shares=shares,
+                unrealized_pnl_pct=unrealized_pnl_pct,
+                reason="Neural debate triggered EXIT signal (bearish trend/distribution)"
+            )
+
+        # 2. Ratchet Trailing Stop:
+        # If position is in profit (e.g. >= +2.5% gain), calculate a ratcheted trailing stop
+        if unrealized_pnl_pct >= 0.025:
+            trail_distance = max(atr * 1.5, current_price * 0.015)
+            proposed_stop = round(current_price - trail_distance, 2)
+
+            # Ensure the stop is only ratcheted UPWARD (protecting capital/locking profit)
+            if proposed_stop > current_stop_price + 0.10:
+                status_msg = "Profit lock ratcheted" if proposed_stop > entry_price else "Trailing stop raised towards break-even"
+                return PositionDirective(
+                    ticker=ticker,
+                    action_type=PositionActionType.UPDATE_STOP,
+                    current_price=current_price,
+                    new_stop_price=proposed_stop,
+                    shares=shares,
+                    unrealized_pnl_pct=unrealized_pnl_pct,
+                    reason=f"{status_msg} (+{unrealized_pnl_pct*100:.1f}% gain, stop raised to ${proposed_stop:.2f})"
+                )
+
+        return PositionDirective(
+            ticker=ticker,
+            action_type=PositionActionType.HOLD,
+            current_price=current_price,
+            new_stop_price=current_stop_price,
+            shares=shares,
+            unrealized_pnl_pct=unrealized_pnl_pct,
+            reason="Position healthy; holding"
         )

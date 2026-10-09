@@ -63,6 +63,13 @@ class ScoutConfig:
 
 
 @dataclass(frozen=True)
+class DaemonConfig:
+    market_hours_interval: int = 60         # 60s sleep during active trading hours
+    off_hours_sleep: int = 900              # 15m sleep when market is closed
+    enable_post_market_training: bool = True
+
+
+@dataclass(frozen=True)
 class Config:
     alpaca_api_key: str
     alpaca_secret_key: str
@@ -71,6 +78,7 @@ class Config:
     risk: RiskConfig
     model: ModelConfig
     scout: ScoutConfig
+    daemon: DaemonConfig = DaemonConfig()
 
     def mask_key(self, key: str) -> str:
         if not key or len(key) < 6:
@@ -112,6 +120,10 @@ def load_config(env_path: str | Path | None = None) -> Config:
     )
 
     scout_cfg = ScoutConfig()
+    daemon_cfg = DaemonConfig(
+        market_hours_interval=int(os.getenv("DAEMON_INTERVAL_MARKET_HOURS", 60)),
+        off_hours_sleep=int(os.getenv("DAEMON_INTERVAL_OFF_HOURS", 900)),
+    )
 
     return Config(
         alpaca_api_key=api_key,
@@ -121,4 +133,5 @@ def load_config(env_path: str | Path | None = None) -> Config:
         risk=risk_cfg,
         model=model_cfg,
         scout=scout_cfg,
+        daemon=daemon_cfg,
     )
