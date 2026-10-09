@@ -11,6 +11,7 @@ from dataclasses import dataclass
 import requests
 from config import Config
 from risk.governor import OrderDirective, OrderSide
+from broker.order_fsm import OrderLifecycleFSM, OrderState
 
 
 @dataclass(frozen=True)
@@ -58,6 +59,7 @@ class AlpacaPaperClient:
     def __init__(self, config: Config, dry_run: bool = False):
         self.config = config
         self.dry_run = dry_run
+        self.fsm = OrderLifecycleFSM()
         self.base_url = config.alpaca_base_url.rstrip("/")
         self.headers = {
             "APCA-API-KEY-ID": config.alpaca_api_key,
@@ -137,7 +139,11 @@ class AlpacaPaperClient:
             return MarketClock(timestamp="", is_open=True, next_open="", next_close="")
 
     def update_stop_loss(self, ticker: str, new_stop_price: float) -> bool:
-        """Finds open stop order for ticker and patches the stop price upward."""
+        """Finds open stop order for ticker and patches the stop price upward.
+        
+        Guards against REST vs WebSocket race conditions: if order was filled milliseconds prior,
+        Alpaca returns 404 or 422. We reconcile this as terminal execution rather than crashing.
+        """
         if self.dry_run:
             return True
         try:
@@ -147,14 +153,34 @@ class AlpacaPaperClient:
                 for ord_info in orders:
                     if ord_info.get("type") in ("stop", "stop_limit") or ord_info.get("stop_price"):
                         order_id = ord_info.get("id")
-                        patch_resp = self.session.patch(
-                            f"{self.base_url}/v2/orders/{order_id}",
-                            json={"stop_price": str(new_stop_price)},
-                            timeout=8
-                        )
-                        return patch_resp.status_code in (200, 201)
+                        if not order_id:
+                            continue
+
+                        # Check pessimistic modification lock
+                        if not self.fsm.acquire_modification_lock(order_id):
+                            # Order is already terminal or modification in flight
+                            return False
+
+                        try:
+                            patch_resp = self.session.patch(
+                                f"{self.base_url}/v2/orders/{order_id}",
+                                json={"stop_price": str(new_stop_price)},
+                                timeout=8
+                            )
+                            if patch_resp.status_code in (200, 201):
+                                return True
+                            elif patch_resp.status_code in (404, 422):
+                                # Reconcile race condition: order was filled or canceled before patch landed
+                                print(f"[Alpaca Gateway] Order {order_id} patch returned {patch_resp.status_code}; order closed on exchange.")
+                                self.fsm.transition(order_id, OrderState.FILLED)
+                                return True
+                            else:
+                                return False
+                        finally:
+                            self.fsm.release_modification_lock(order_id)
             return False
-        except Exception:
+        except Exception as e:
+            print(f"[Alpaca Gateway] Exception updating stop loss for {ticker}: {e}")
             return False
 
     def get_order_by_client_id(self, client_order_id: str) -> dict | None:
@@ -187,8 +213,10 @@ class AlpacaPaperClient:
             )
 
         client_order_id = f"bot_{uuid.uuid4().hex[:16]}"
+        self.fsm.register_order(client_order_id, initial_state=OrderState.PENDING_NEW)
 
         if self.dry_run:
+            self.fsm.transition(client_order_id, OrderState.FILLED)
             return ExecutionResult(
                 success=True,
                 order_id=f"SIM_{directive.ticker}_{directive.shares}_{client_order_id[:8]}",

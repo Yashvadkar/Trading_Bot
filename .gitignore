@@ -5,6 +5,8 @@
 
 # SQLite and Telemetry Databases
 *.db
+*.db-shm
+*.db-wal
 *.sqlite
 *.sqlite3
 

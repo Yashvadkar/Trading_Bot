@@ -6,6 +6,7 @@ and executed trade with parameterized SQL statements and clean DAO patterns.
 
 from __future__ import annotations
 import sqlite3
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,13 +31,19 @@ class TradeLedger:
         self.db_path = Path(db_path)
         self._init_schema()
 
-    def _get_connection(self) -> sqlite3.Connection:
+    @contextmanager
+    def _get_connection(self):
+        """Yields an active SQLite connection configured with WAL pragmas, committing and closing on exit."""
         conn = sqlite3.connect(self.db_path, timeout=10.0, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
         conn.execute("PRAGMA busy_timeout=5000;")
-        return conn
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            conn.close()
 
     def _init_schema(self) -> None:
         """Create structured tables with proper indexes."""
@@ -112,6 +119,25 @@ class TradeLedger:
             )
 
     def get_recent_trades(self, limit: int = 10) -> list[dict]:
+        """Eagerly drains recent trade records into plain memory dicts to avoid lingering cursor locks."""
         with self._get_connection() as conn:
-            rows = conn.execute("SELECT * FROM trades_log ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM trades_log ORDER BY id DESC LIMIT ?", (limit,))
+            rows = cursor.fetchall()
             return [dict(r) for r in rows]
+
+    def checkpoint_wal(self, mode: str = "PASSIVE") -> tuple[int, int, int]:
+        """Executes explicit WAL checkpoint to truncate WAL file and reclaim disk frames.
+        
+        Mitigates checkpoint starvation caused by high-throughput concurrent readers.
+        Modes: PASSIVE, FULL, RESTART, TRUNCATE.
+        Returns: (busy, log_frames, checkpointed_frames)
+        """
+        valid_mode = mode.upper() if mode.upper() in ("PASSIVE", "FULL", "RESTART", "TRUNCATE") else "PASSIVE"
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(f"PRAGMA wal_checkpoint({valid_mode});")
+            row = cursor.fetchone()
+            if row:
+                return int(row[0]), int(row[1]), int(row[2])
+            return 0, 0, 0

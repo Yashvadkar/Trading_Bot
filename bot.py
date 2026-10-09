@@ -260,7 +260,8 @@ class TradingBot:
                 f"Consensus: {'APPROVED' if verdict.is_consensus_approved else 'REJECTED (High Uncertainty)'}"
             )
 
-            # 5. Risk Governor Evaluation
+            # 5. Risk Governor Evaluation (with Conformal Kelly and CVD Urgency)
+            cvd_div = getattr(stock.microstructure, "cvd_divergence", 0.0) if hasattr(stock, "microstructure") else 0.0
             directive: OrderDirective = self.governor.evaluate_order(
                 ticker=stock.ticker,
                 action=verdict.chosen_action,
@@ -270,7 +271,8 @@ class TradingBot:
                 available_cash=account.cash,
                 current_positions_count=len(positions),
                 is_already_held=(stock.ticker in held_tickers),
-                circuit_breaker_active=(breaker_state.status != BreakerStatus.NORMAL)
+                circuit_breaker_active=(breaker_state.status != BreakerStatus.NORMAL),
+                cvd_divergence=cvd_div
             )
 
             if directive.is_authorized:
@@ -320,6 +322,14 @@ class TradingBot:
         if len(self.buffer) >= self.config.model.batch_size:
             metrics = self.trainer.train_step(self.buffer, batch_size=self.config.model.batch_size)
             print(f"[Self-Learning] Online training step {metrics.total_steps} completed | Bull Loss: {metrics.bull_loss:.4f} | Bear Loss: {metrics.bear_loss:.4f}")
+
+        # 8. Maintenance: Proactively checkpoint SQLite WAL log to prevent checkpoint starvation
+        try:
+            busy, log_frames, checkpointed = self.ledger.checkpoint_wal(mode="PASSIVE")
+            if log_frames > 0:
+                print(f"[Persistence] SQLite WAL checkpointed {checkpointed}/{log_frames} frames to disk.")
+        except Exception:
+            pass
 
         elapsed = time.time() - start_time
         print(f"[Cycle Finished] Completed in {elapsed:.2f}s | Orders Authorized: {authorized_count} | Executed: {executed_count}")

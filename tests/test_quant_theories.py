@@ -138,6 +138,37 @@ class TestQuantTheoryEngine(unittest.TestCase):
         self.assertEqual(feats.chaos_evt_vector.shape, (10,))
         self.assertEqual(feats.elm_latent_state.shape, (16,))
 
+    def test_rmt_ill_conditioned_stability(self):
+        # Create an ill-conditioned singular return matrix (perfectly collinear assets)
+        T, N = 100, 5
+        base_series = np.random.normal(0, 0.01, (T, 1))
+        # Identical columns yield rank 1 matrix with 4 zero eigenvalues
+        collinear_returns = np.repeat(base_series, N, axis=1)
+
+        cleaned_corr, top_evals, noise_ratio = self.engine.denoise_correlation_matrix_rmt(collinear_returns)
+
+        # Check positive definiteness via Cholesky or eigenvalue floor
+        evals = np.linalg.eigvalsh(cleaned_corr)
+        self.assertTrue((evals > 0).all(), "Cleaned matrix must be strictly positive definite")
+        self.assertFalse(np.isnan(cleaned_corr).any())
+        self.assertFalse(np.isinf(cleaned_corr).any())
+        # Condition number must be well-bounded
+        cond_num = np.linalg.cond(cleaned_corr)
+        self.assertLess(cond_num, 1e4)
+
+    def test_cvd_divergence_calculation(self):
+        # Test Cumulative Volume Delta absorption calculation
+        highs = np.array([100, 102, 101, 103, 105, 104, 106, 107, 108, 110], dtype=float)
+        lows = np.array([98, 99, 99, 100, 102, 101, 103, 104, 105, 107], dtype=float)
+        closes = np.array([99, 101, 100, 102, 103, 102, 105, 106, 107, 109], dtype=float)
+        volumes = np.array([1000, 1200, 1100, 1500, 1800, 1400, 2000, 2200, 2100, 2500], dtype=float)
+
+        cvd, div = QuantTheoryEngine.compute_cumulative_volume_delta(highs, lows, closes, volumes)
+        self.assertIsInstance(cvd, float)
+        self.assertIsInstance(div, float)
+        self.assertTrue(-1.0 <= cvd <= 1.0)
+        self.assertIn(div, (-1.0, 0.0, 1.0))
+
 
 if __name__ == "__main__":
     unittest.main()

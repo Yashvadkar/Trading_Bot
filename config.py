@@ -44,6 +44,9 @@ class RiskConfig:
     otr_soft_threshold: float = 35.0       # Soft OTR limit to throttle cancellations
     otr_kill_threshold: float = 45.0       # Hard OTR limit to engage regulatory kill-switch
     otr_window_seconds: int = 86400        # Rolling window in seconds (24h)
+    otr_proximity_delta: float = 0.0075    # SEBI/NSE proximity exemption (+-0.75% of LTP)
+    conformal_alpha: float = 0.20          # Conformal prediction miscoverage rate (80% coverage)
+    conformal_z_score: float = 1.2816      # Standard normal quantile for alpha=0.20
 
 
 @dataclass(frozen=True)

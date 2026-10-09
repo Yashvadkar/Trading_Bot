@@ -11,6 +11,7 @@ The ultimate gatekeeper between AI model signals and broker execution:
 
 from __future__ import annotations
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 import numpy as np
@@ -55,41 +56,66 @@ class PositionDirective:
 
 
 class OTRTracker:
-    """Regulatory Order-to-Trade Ratio (OTR) monitor."""
+    """Regulatory Order-to-Trade Ratio (OTR) monitor with SEBI/NSE proximity exemption.
+    
+    Orders placed within +-delta (default 0.75% for cash equities) of the Last Traded Price (LTP)
+    are exempt from the high OTR penalty numerator to avoid penalizing near-market liquidity provision.
+    Uses collections.deque for zero-copy O(1) rolling window pruning.
+    """
 
-    def __init__(self, soft_limit: float = 35.0, kill_limit: float = 45.0, window_sec: int = 86400):
+    def __init__(
+        self,
+        soft_limit: float = 35.0,
+        kill_limit: float = 45.0,
+        window_sec: int = 86400,
+        proximity_delta: float = 0.0075
+    ):
         self.soft_limit = soft_limit
         self.kill_limit = kill_limit
         self.window_sec = window_sec
-        self.orders: list[float] = []
-        self.trades: list[float] = []
+        self.proximity_delta = proximity_delta
+        self.non_exempt_orders: deque[float] = deque()
+        self.exempt_orders: deque[float] = deque()
+        self.trades: deque[float] = deque()
 
-    def record_order(self) -> None:
-        self.orders.append(time.time())
+    def record_order(self, price: float | None = None, ltp: float | None = None) -> None:
+        """Records an order timestamp, checking for proximity exemption."""
+        now = time.time()
+        # SEBI / NSE proximity exemption: |P - LTP| / LTP <= delta
+        if price is not None and ltp is not None and ltp > 0:
+            diff_pct = abs(price - ltp) / ltp
+            if diff_pct <= self.proximity_delta:
+                self.exempt_orders.append(now)
+                return
+        self.non_exempt_orders.append(now)
 
     def record_trade(self) -> None:
         self.trades.append(time.time())
 
     def _prune(self, now: float) -> None:
         cutoff = now - self.window_sec
-        self.orders = [t for t in self.orders if t >= cutoff]
-        self.trades = [t for t in self.trades if t >= cutoff]
+        while self.non_exempt_orders and self.non_exempt_orders[0] < cutoff:
+            self.non_exempt_orders.popleft()
+        while self.exempt_orders and self.exempt_orders[0] < cutoff:
+            self.exempt_orders.popleft()
+        while self.trades and self.trades[0] < cutoff:
+            self.trades.popleft()
 
     def get_current_otr(self) -> float:
         now = time.time()
         self._prune(now)
-        order_count = len(self.orders)
+        penalty_orders = len(self.non_exempt_orders)
         trade_count = len(self.trades)
         if trade_count == 0:
-            return float(order_count)
-        return float(order_count) / float(trade_count)
+            return float(penalty_orders)
+        return float(penalty_orders) / float(trade_count)
 
     def check_safety(self) -> tuple[bool, str | None]:
         now = time.time()
         self._prune(now)
         otr = self.get_current_otr()
-        # Enforce check once at least 10 orders have been submitted
-        if len(self.orders) >= 10:
+        # Enforce check once at least 10 non-exempt orders have been submitted
+        if len(self.non_exempt_orders) >= 10:
             if otr >= self.kill_limit:
                 return False, f"OTR Regulatory Kill-Switch engaged: ratio {otr:.1f}:1 exceeds exchange penalty ceiling ({self.kill_limit}:1)"
             if otr >= self.soft_limit:
@@ -98,23 +124,70 @@ class OTRTracker:
 
 
 class AlmgrenChrissSlicer:
-    """Almgren-Chriss Optimal Execution Parent-Order Slicer (TWAP/POV)."""
+    """Almgren-Chriss Optimal Execution Parent-Order Slicer (TWAP/POV) with CVD modulation."""
 
     @staticmethod
+    def calculate_urgency(
+        volatility: float = 0.02,
+        risk_aversion: float = 1e-6,
+        temp_impact: float = 2.5e-7,
+        cvd_divergence: float = 0.0,
+        side: OrderSide = OrderSide.BUY
+    ) -> float:
+        """Calculates Almgren-Chriss urgency parameter kappa, modulated by CVD absorption.
+        
+        kappa = sqrt(lambda * sigma^2 / eta)
+        - If selling into bullish absorption (passive buyer wall, cvd_divergence = 1.0),
+          dampens urgency by 50% to avoid crossing the spread into passive liquidity.
+        - If selling during aggressive seller exhaustion or aligned trend, boosts urgency by 30%.
+        """
+        base_urgency = float(np.sqrt((max(risk_aversion, 1e-8) * (volatility ** 2)) / max(temp_impact, 1e-8)))
+
+        # Heuristic modulation via CVD Absorption Divergence
+        if side == OrderSide.SELL and cvd_divergence > 0.0:
+            # Passive buyers absorbing selling pressure at support -> throttle urgency
+            multiplier = 0.50
+        elif side == OrderSide.BUY and cvd_divergence < 0.0:
+            # Passive sellers absorbing buying pressure at resistance -> throttle urgency
+            multiplier = 0.50
+        elif abs(cvd_divergence) > 0.0:
+            # Momentum aligned with order -> front-load urgency
+            multiplier = 1.30
+        else:
+            multiplier = 1.0
+
+        return float(base_urgency * multiplier)
+
+    @classmethod
     def slice_order(
+        cls,
         total_shares: int,
         price: float,
         adv: float = 10_000_000.0,
         max_pov_pct: float = 0.05,
-        threshold_usd: float = 10_000.0
+        threshold_usd: float = 10_000.0,
+        volatility: float = 0.02,
+        cvd_divergence: float = 0.0,
+        side: OrderSide = OrderSide.BUY
     ) -> list[int]:
-        """Slices parent orders exceeding $10k to minimize Implementation Shortfall."""
+        """Slices parent orders into discrete child orders with CVD-modulated urgency."""
         total_usd = total_shares * price
         if total_usd < threshold_usd or total_shares <= 10:
             return [total_shares]
 
         daily_shares = max(adv / max(price, 1.0), 1000.0)
-        max_slice = max(10, int(daily_shares * max_pov_pct / 10.0))  # 10% of POV block
+        base_slice = max(10, int(daily_shares * max_pov_pct / 10.0))  # 10% of POV block
+
+        # Modulate slice size by Almgren-Chriss urgency
+        urgency = cls.calculate_urgency(
+            volatility=volatility,
+            cvd_divergence=cvd_divergence,
+            side=side
+        )
+        # When urgency is high, front-load child slice sizes; when low, smaller TWAP slices
+        urgency_multiplier = float(np.clip(1.0 + (urgency * 5.0 - 0.2), 0.5, 2.0))
+        max_slice = max(10, int(base_slice * urgency_multiplier))
+
         if max_slice >= total_shares:
             return [total_shares]
 
@@ -127,17 +200,43 @@ class AlmgrenChrissSlicer:
         return slices
 
 
+def calculate_conformal_volatility(
+    residuals: np.ndarray | list[float] | None,
+    alpha: float = 0.20,
+    z_score: float = 1.2816
+) -> float:
+    """Extracts scale sigma from the empirical (1 - alpha) rolling conformal prediction interval.
+    
+    Formula: sigma_hat = q_eff / z_(1 - alpha/2)
+    where q_eff is the (1 - alpha) empirical quantile of absolute forecast residuals.
+    """
+    if residuals is None:
+        return 0.02
+    arr = np.asarray(residuals, dtype=np.float64)
+    if len(arr) < 5:
+        return 0.02
+    abs_res = np.abs(arr)
+    # Target coverage: 1 - alpha (e.g. 0.80 for alpha=0.20)
+    q_eff = float(np.quantile(abs_res, 1.0 - alpha))
+    sigma_hat = float(max(q_eff / max(z_score, 1e-4), 1e-4))
+    return sigma_hat
+
+
 def calculate_fractional_kelly_capital(
     returns: np.ndarray | list[float] | None,
     portfolio_equity: float,
     kappa: float = 0.15,
     max_leverage: float = 1.5,
-    max_capital_pct: float = 0.20
+    max_capital_pct: float = 0.20,
+    conformal_residuals: np.ndarray | list[float] | None = None,
+    conformal_alpha: float = 0.20,
+    conformal_z_score: float = 1.2816
 ) -> float:
-    """Calculates capital allocation using Fractional Kelly Criterion.
+    """Calculates capital allocation using Fractional Kelly with Conformal Uncertainty.
     
-    Formula: f^* = kappa * (mu / sigma^2)
-    Tempered by parameter estimation uncertainty kappa (0.15) and gross leverage ceiling.
+    Formula: f^* = kappa * (mu / sigma_eff^2)
+    When conformal residuals are available, sigma_eff is derived directly from the
+    conformal prediction interval width rather than naive historical sample variance.
     """
     if returns is None:
         return portfolio_equity * 0.15
@@ -147,7 +246,12 @@ def calculate_fractional_kelly_capital(
         return portfolio_equity * 0.15
 
     mu = float(np.mean(arr))
-    sigma_sq = float(np.var(arr))
+
+    if conformal_residuals is not None and len(conformal_residuals) >= 5:
+        sigma_conf = calculate_conformal_volatility(conformal_residuals, alpha=conformal_alpha, z_score=conformal_z_score)
+        sigma_sq = float(sigma_conf ** 2)
+    else:
+        sigma_sq = float(np.var(arr))
 
     # Reject if variance is near 0 or historical drift is non-positive
     if sigma_sq <= 1e-8 or np.isnan(sigma_sq) or mu <= 0.0:
@@ -160,6 +264,35 @@ def calculate_fractional_kelly_capital(
     return float(portfolio_equity * constrained_fraction)
 
 
+def allocate_portfolio_with_cash_preservation(
+    target_fractions: dict[str, float],
+    max_leverage: float = 1.5,
+    uncertainty_scale: float = 1.0
+) -> dict[str, float]:
+    """Allocates portfolio weights preserving CASH during systemic uncertainty.
+    
+    Prevents the uniform gross leverage washout trap: when conformal uncertainty expands
+    across the entire market (uncertainty_scale > 1.0), the gross ceiling is dampened,
+    allowing unallocated capital to rest safely in CASH rather than forcing full leverage.
+    """
+    if not target_fractions:
+        return {}
+
+    effective_gross_cap = max_leverage / max(1.0, uncertainty_scale)
+    total_requested = sum(max(0.0, f) for f in target_fractions.values())
+
+    if total_requested <= 0.0:
+        return {k: 0.0 for k in target_fractions}
+
+    # If within effective gross cap, keep positions as-is (remaining capital is CASH)
+    if total_requested <= effective_gross_cap:
+        return {k: max(0.0, f) for k, f in target_fractions.items()}
+
+    # Scale down proportionally to the uncertainty-dampened gross cap
+    scale = effective_gross_cap / total_requested
+    return {k: max(0.0, f) * scale for k, f in target_fractions.items()}
+
+
 class RiskGovernor:
     """Mathematical gatekeeper authorizing, sizing, or rejecting trade orders."""
 
@@ -168,7 +301,8 @@ class RiskGovernor:
         self.otr_tracker = OTRTracker(
             soft_limit=getattr(risk_cfg, "otr_soft_threshold", 35.0),
             kill_limit=getattr(risk_cfg, "otr_kill_threshold", 45.0),
-            window_sec=getattr(risk_cfg, "otr_window_seconds", 86400)
+            window_sec=getattr(risk_cfg, "otr_window_seconds", 86400),
+            proximity_delta=getattr(risk_cfg, "otr_proximity_delta", 0.0075)
         )
         self.slicer = AlmgrenChrissSlicer()
 
@@ -184,7 +318,9 @@ class RiskGovernor:
         is_already_held: bool,
         circuit_breaker_active: bool,
         evt_var_99: float = 0.0,
-        returns_history: np.ndarray | None = None
+        returns_history: np.ndarray | None = None,
+        conformal_residuals: np.ndarray | None = None,
+        cvd_divergence: float = 0.0
     ) -> OrderDirective:
         """Evaluates trade intent and returns an authorized, sized order or rejection."""
         # 1. Action 0: HOLD
@@ -215,7 +351,7 @@ class RiskGovernor:
                     is_authorized=False,
                     rejection_reason="Exit requested but ticker is not in portfolio"
                 )
-            self.otr_tracker.record_order()
+            self.otr_tracker.record_order(price=current_price, ltp=current_price)
             return OrderDirective(
                 ticker=ticker,
                 side=OrderSide.SELL,
@@ -315,7 +451,7 @@ class RiskGovernor:
                 rejection_reason="Share sizing rounded to 0 under ATR risk budget"
             )
 
-        # Fractional Kelly Capital Allocation
+        # Fractional Kelly Capital Allocation (with Conformal Uncertainty)
         kelly_fraction = getattr(self.cfg, "kelly_fraction", 0.15)
         max_lev = getattr(self.cfg, "max_leverage", 1.5)
         kelly_capital = calculate_fractional_kelly_capital(
@@ -323,7 +459,10 @@ class RiskGovernor:
             portfolio_equity=portfolio_equity,
             kappa=kelly_fraction,
             max_leverage=max_lev,
-            max_capital_pct=0.20
+            max_capital_pct=0.20,
+            conformal_residuals=conformal_residuals,
+            conformal_alpha=getattr(self.cfg, "conformal_alpha", 0.20),
+            conformal_z_score=getattr(self.cfg, "conformal_z_score", 1.2816)
         )
 
         # Cap single position to max Fractional Kelly allocation, available cash, or 20% equity
@@ -363,11 +502,17 @@ class RiskGovernor:
         actual_allocation = float(final_shares * current_price)
         actual_risk_pct = float((final_shares * stop_dist) / portfolio_equity) if portfolio_equity > 0 else 0.0
 
-        # Almgren-Chriss Order Slicing for parent orders
-        child_slices = self.slicer.slice_order(final_shares, current_price, adv=self.cfg.min_avg_daily_volume_usd)
+        # Almgren-Chriss Order Slicing for parent orders (modulated by CVD absorption)
+        child_slices = self.slicer.slice_order(
+            final_shares,
+            current_price,
+            adv=self.cfg.min_avg_daily_volume_usd,
+            cvd_divergence=cvd_divergence,
+            side=OrderSide.BUY
+        )
 
-        # Record authorized order in OTR tracker
-        self.otr_tracker.record_order()
+        # Record authorized order in OTR tracker (proximity-exempt at market price)
+        self.otr_tracker.record_order(price=current_price, ltp=current_price)
 
         return OrderDirective(
             ticker=ticker,

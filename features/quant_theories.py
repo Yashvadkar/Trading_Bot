@@ -89,9 +89,9 @@ class QuantTheoryEngine:
 
         # Eigen-decomposition (Hermitian / symmetric)
         eigenvalues, eigenvectors = np.linalg.eigh(corr)
-        # Sort descending
+        # Sort descending and clip small/negative eigenvalues to positive floor
         idx = np.argsort(eigenvalues)[::-1]
-        eigenvalues = np.maximum(eigenvalues[idx], 1e-8)
+        eigenvalues = np.clip(eigenvalues[idx], a_min=1e-8, a_max=None)
         eigenvectors = eigenvectors[:, idx]
 
         # Marčenko-Pastur upper bound: q = N / T, variance sigma^2 ~ 1 for normalized returns
@@ -106,15 +106,23 @@ class QuantTheoryEngine:
         cleaned_eigenvalues = eigenvalues.copy()
         if np.any(is_noise):
             noise_mean = float(np.mean(eigenvalues[is_noise]))
-            cleaned_eigenvalues[is_noise] = noise_mean
+            cleaned_eigenvalues[is_noise] = max(noise_mean, 1e-8)
 
-        # Reconstruct cleaned correlation matrix: C = V * Lambda * V^T
-        cleaned_corr = eigenvectors @ np.diag(cleaned_eigenvalues) @ eigenvectors.T
-        # Rescale diagonals to strictly 1.0
-        d = np.sqrt(np.diag(cleaned_corr))
-        d_outer = np.outer(d, d)
-        cleaned_corr = np.divide(cleaned_corr, d_outer, out=np.zeros_like(cleaned_corr), where=(d_outer > 0))
-        np.fill_diagonal(cleaned_corr, 1.0)
+        # Scoped numerical context for matrix reconstruction and diagonal rescaling
+        with np.errstate(divide='ignore', invalid='ignore'):
+            # Reconstruct cleaned correlation matrix: C = V * Lambda * V^T
+            cleaned_corr = eigenvectors @ np.diag(cleaned_eigenvalues) @ eigenvectors.T
+            # Rescale diagonals to strictly 1.0
+            d = np.sqrt(np.maximum(np.diag(cleaned_corr), 1e-8))
+            d_outer = np.outer(d, d)
+            cleaned_corr = np.divide(cleaned_corr, d_outer, out=np.zeros_like(cleaned_corr), where=(d_outer > 0))
+            np.fill_diagonal(cleaned_corr, 1.0)
+
+            # Post-clipping Ledoit-Wolf structured shrinkage toward Identity
+            # Guarantees strict positive definiteness and bounds condition number
+            alpha_shrink = 0.05
+            cleaned_corr = (1.0 - alpha_shrink) * cleaned_corr + alpha_shrink * np.eye(N)
+            np.fill_diagonal(cleaned_corr, 1.0)
 
         noise_ratio = float(np.sum(is_noise)) / float(N)
         top_evals = cleaned_eigenvalues[:min(N, 4)]
