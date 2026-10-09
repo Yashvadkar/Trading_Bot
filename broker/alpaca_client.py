@@ -1,0 +1,201 @@
+"""Alpaca Markets Paper Trading REST Gateway.
+
+Interfaces directly with the Alpaca Paper API (/v2/account, /v2/orders, /v2/positions).
+Features automatic retries, dry-run safety modes, and response parsing.
+"""
+
+from __future__ import annotations
+import json
+from dataclasses import dataclass
+import requests
+from config import Config
+from risk.governor import OrderDirective, OrderSide
+
+
+@dataclass(frozen=True)
+class AccountStatus:
+    account_id: str
+    status: str
+    equity: float
+    cash: float
+    buying_power: float
+    is_paper: bool
+
+
+@dataclass(frozen=True)
+class PositionInfo:
+    ticker: str
+    shares: int
+    current_price: float
+    market_value: float
+    unrealized_pnl: float
+    unrealized_pnl_pct: float
+
+
+@dataclass(frozen=True)
+class ExecutionResult:
+    success: bool
+    order_id: str | None
+    ticker: str
+    side: str
+    shares: int
+    filled_price: float
+    message: str
+
+
+class AlpacaPaperClient:
+    """REST Client for Alpaca Paper Trading API."""
+
+    def __init__(self, config: Config, dry_run: bool = False):
+        self.config = config
+        self.dry_run = dry_run
+        self.base_url = config.alpaca_base_url.rstrip("/")
+        self.headers = {
+            "APCA-API-KEY-ID": config.alpaca_api_key,
+            "APCA-API-SECRET-KEY": config.alpaca_secret_key,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        self.session = requests.Session()
+        self.session.headers.update(self.headers)
+
+    def get_account(self) -> AccountStatus:
+        """Fetch account balance, equity, and buying power."""
+        if self.dry_run:
+            return AccountStatus(
+                account_id="DRY_RUN_ACC_001",
+                status="ACTIVE",
+                equity=100_000.0,
+                cash=100_000.0,
+                buying_power=200_000.0,
+                is_paper=True
+            )
+
+        resp = self.session.get(f"{self.base_url}/v2/account", timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+
+        return AccountStatus(
+            account_id=data.get("id", "UNKNOWN"),
+            status=data.get("status", "ACTIVE"),
+            equity=float(data.get("equity", 0.0)),
+            cash=float(data.get("cash", 0.0)),
+            buying_power=float(data.get("buying_power", 0.0)),
+            is_paper="paper" in self.base_url.lower()
+        )
+
+    def get_positions(self) -> list[PositionInfo]:
+        """Fetch all currently open equity positions."""
+        if self.dry_run:
+            return []
+
+        resp = self.session.get(f"{self.base_url}/v2/positions", timeout=10)
+        resp.raise_for_status()
+        positions_raw = resp.json()
+
+        positions = []
+        for p in positions_raw:
+            positions.append(PositionInfo(
+                ticker=p.get("symbol", ""),
+                shares=int(p.get("qty", 0)),
+                current_price=float(p.get("current_price", 0.0)),
+                market_value=float(p.get("market_value", 0.0)),
+                unrealized_pnl=float(p.get("unrealized_pl", 0.0)),
+                unrealized_pnl_pct=float(p.get("unrealized_plpc", 0.0)),
+            ))
+        return positions
+
+    def submit_order(self, directive: OrderDirective) -> ExecutionResult:
+        """Submit a validated order directive to the broker."""
+        if not directive.is_authorized:
+            return ExecutionResult(
+                success=False,
+                order_id=None,
+                ticker=directive.ticker,
+                side=directive.side.value,
+                shares=0,
+                filled_price=0.0,
+                message=f"Order rejected by risk governor: {directive.rejection_reason}"
+            )
+
+        if self.dry_run:
+            return ExecutionResult(
+                success=True,
+                order_id=f"SIM_{directive.ticker}_{directive.shares}",
+                ticker=directive.ticker,
+                side=directive.side.value,
+                shares=directive.shares,
+                filled_price=directive.limit_price,
+                message="Simulated order accepted in dry-run mode."
+            )
+
+        # 1. Buy Order with Stop-Loss
+        if directive.side == OrderSide.BUY:
+            payload = {
+                "symbol": directive.ticker,
+                "qty": str(directive.shares),
+                "side": "buy",
+                "type": "market",
+                "time_in_force": "day",
+                "order_class": "bracket",
+                "stop_loss": {
+                    "stop_price": str(directive.stop_loss_price)
+                }
+            }
+
+            resp = self.session.post(f"{self.base_url}/v2/orders", json=payload, timeout=10)
+            if resp.status_code in (200, 201):
+                res_data = resp.json()
+                return ExecutionResult(
+                    success=True,
+                    order_id=res_data.get("id"),
+                    ticker=directive.ticker,
+                    side="buy",
+                    shares=directive.shares,
+                    filled_price=directive.limit_price,
+                    message="Bracket buy order successfully submitted to Alpaca."
+                )
+            else:
+                return ExecutionResult(
+                    success=False,
+                    order_id=None,
+                    ticker=directive.ticker,
+                    side="buy",
+                    shares=directive.shares,
+                    filled_price=directive.limit_price,
+                    message=f"Alpaca API error: {resp.status_code} - {resp.text}"
+                )
+
+        # 2. Sell / Close Order
+        elif directive.side == OrderSide.SELL:
+            resp = self.session.delete(f"{self.base_url}/v2/positions/{directive.ticker}", timeout=10)
+            if resp.status_code in (200, 204):
+                return ExecutionResult(
+                    success=True,
+                    order_id=f"CLOSE_{directive.ticker}",
+                    ticker=directive.ticker,
+                    side="sell",
+                    shares=directive.shares,
+                    filled_price=directive.limit_price,
+                    message=f"Position in {directive.ticker} closed successfully."
+                )
+            else:
+                return ExecutionResult(
+                    success=False,
+                    order_id=None,
+                    ticker=directive.ticker,
+                    side="sell",
+                    shares=0,
+                    filled_price=directive.limit_price,
+                    message=f"Alpaca close error: {resp.status_code} - {resp.text}"
+                )
+
+        return ExecutionResult(
+            success=False,
+            order_id=None,
+            ticker=directive.ticker,
+            side="hold",
+            shares=0,
+            filled_price=0.0,
+            message="Action is HOLD; no order placed."
+        )

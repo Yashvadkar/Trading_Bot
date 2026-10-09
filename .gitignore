@@ -1,0 +1,25 @@
+# Environment and Secret Files
+.env
+.env.*
+*.env
+
+# SQLite and Telemetry Databases
+*.db
+*.sqlite
+*.sqlite3
+
+# PyTorch Checkpoints and Weights
+*.pt
+*.pth
+*.onnx
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Logs and Runtime Scratch
+logs/
+*.log
+/tmp/
