@@ -23,3 +23,5 @@ __pycache__/
 logs/
 *.log
 /tmp/
+data/cache/
+*.npz

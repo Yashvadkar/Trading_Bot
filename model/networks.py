@@ -15,7 +15,7 @@ import torch.nn.functional as F
 class BullNetwork(nn.Module):
     """Optimistic Upside Seeker: Identifies momentum, breakout velocity, and catalyst upside."""
 
-    def __init__(self, state_dim: int = 32, hidden_dim: int = 128, num_actions: int = 4):
+    def __init__(self, state_dim: int = 64, hidden_dim: int = 128, num_actions: int = 4):
         super().__init__()
         self.fc_in = nn.Linear(state_dim, hidden_dim)
         self.gru = nn.GRU(hidden_dim, hidden_dim, num_layers=2, batch_first=True)
@@ -46,7 +46,7 @@ class BullNetwork(nn.Module):
 class BearNetwork(nn.Module):
     """Adversarial Tail-Risk Seeker: Identifies traps, resistance, debt headwinds, and drawdown."""
 
-    def __init__(self, state_dim: int = 32, hidden_dim: int = 128, num_actions: int = 4):
+    def __init__(self, state_dim: int = 64, hidden_dim: int = 128, num_actions: int = 4):
         super().__init__()
         self.fc_in = nn.Linear(state_dim, hidden_dim)
         self.gru = nn.GRU(hidden_dim, hidden_dim, num_layers=2, batch_first=True)

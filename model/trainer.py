@@ -1,11 +1,14 @@
-"""Asymmetric Co-Trainer for Bull, Bear, and Arbiter Networks.
+"""Asymmetric Co-Trainer with Active Inference (Free Energy Principle).
 
 Karpathy First-Principles Standard:
 - Explicit gradient steps without blackbox RL frameworks.
+- Active Inference / Free Energy Principle (FEP):
+  Arbiter minimizes Variational Free Energy F = Complexity (KL to prior) - Accuracy (TD Return)
+  Epistemic uncertainty dynamically scales the complexity penalty to prevent overtrading in chaotic regimes.
 - Asymmetric objective functions:
   Bull rewarded on upside capture.
   Bear rewarded on downside risk mitigation.
-  Arbiter rewarded on consensus accuracy and net Sharpe ratio.
+  Arbiter settles execution by minimizing variational free energy.
 """
 
 from __future__ import annotations
@@ -23,11 +26,12 @@ class TrainMetrics:
     bull_loss: float
     bear_loss: float
     arbiter_loss: float
+    free_energy: float
     total_steps: int
 
 
 class EnsembleTrainer:
-    """Trains the 3-network debate ensemble with asymmetric reward shaping."""
+    """Trains the 3-network debate ensemble with Active Inference and asymmetric objectives."""
 
     def __init__(
         self,
@@ -36,24 +40,30 @@ class EnsembleTrainer:
         arbiter_net: ArbiterNetwork,
         lr: float = 3e-4,
         gamma: float = 0.99,
+        fep_beta: float = 0.05,       # Free energy complexity temperature
         device: str = "cpu"
     ):
         self.bull_net = bull_net.to(device)
         self.bear_net = bear_net.to(device)
         self.arbiter_net = arbiter_net.to(device)
         self.gamma = gamma
+        self.fep_beta = fep_beta
         self.device = device
 
         self.opt_bull = optim.AdamW(self.bull_net.parameters(), lr=lr, weight_decay=1e-4)
         self.opt_bear = optim.AdamW(self.bear_net.parameters(), lr=lr, weight_decay=1e-4)
         self.opt_arbiter = optim.AdamW(self.arbiter_net.parameters(), lr=lr, weight_decay=1e-4)
 
+        # Conservative prior over actions [Hold, Buy 0.5x, Buy 1.0x, Exit]
+        # Tilt towards Hold (0.4) and Exit (0.2)
+        self.action_prior = torch.tensor([0.40, 0.20, 0.20, 0.20], dtype=torch.float32, device=device).unsqueeze(0)
+
         self.steps = 0
 
     def train_step(self, buffer: ReplayBuffer, batch_size: int = 32) -> TrainMetrics:
-        """Executes one co-training optimization step across the ensemble."""
+        """Executes one co-training optimization step with Active Inference Free Energy minimization."""
         if len(buffer) < batch_size:
-            return TrainMetrics(bull_loss=0.0, bear_loss=0.0, arbiter_loss=0.0, total_steps=self.steps)
+            return TrainMetrics(bull_loss=0.0, bear_loss=0.0, arbiter_loss=0.0, free_energy=0.0, total_steps=self.steps)
 
         states, actions, rewards, next_states, dones, disagreements = buffer.sample(batch_size)
         states = states.to(self.device)
@@ -106,7 +116,7 @@ class EnsembleTrainer:
         self.opt_bear.step()
 
         # ----------------------------------------------------
-        # 3. Arbiter Network Update: Net reward calibration
+        # 3. Arbiter Network: Active Inference & Free Energy Minimization
         # ----------------------------------------------------
         arbiter_probs, arbiter_val = self.arbiter_net(h_bull.detach(), h_bear.detach(), disagreements)
         with torch.no_grad():
@@ -117,10 +127,23 @@ class EnsembleTrainer:
             _, next_arb_val = self.arbiter_net(next_h_bull, next_h_bear, next_dis)
             arbiter_target = rewards + self.gamma * (1.0 - dones) * next_arb_val
 
+        # Accuracy term: TD Error
         arb_action_probs = arbiter_probs.gather(1, actions.unsqueeze(1))
-        arb_policy_loss = -torch.log(arb_action_probs + 1e-8) * (arbiter_target - arbiter_val.detach())
+        arb_td_loss = -torch.log(arb_action_probs + 1e-8) * (arbiter_target - arbiter_val.detach())
         arb_val_loss = F.mse_loss(arbiter_val, arbiter_target)
-        arbiter_loss = arb_policy_loss.mean() + 0.5 * arb_val_loss
+
+        # Complexity term: KL divergence from prior beliefs D_KL(q || p)
+        # Scaled by epistemic disagreement variance (higher uncertainty = stronger pull to prior)
+        kl_complexity = torch.sum(
+            arbiter_probs * (torch.log(arbiter_probs + 1e-8) - torch.log(self.action_prior + 1e-8)),
+            dim=-1,
+            keepdim=True
+        )
+        scaled_complexity = (1.0 + 2.0 * disagreements) * kl_complexity
+
+        # Variational Free Energy: F = Accuracy Loss + Beta * Complexity
+        free_energy = arb_td_loss.mean() + self.fep_beta * scaled_complexity.mean()
+        arbiter_loss = free_energy + 0.5 * arb_val_loss
 
         self.opt_arbiter.zero_grad()
         arbiter_loss.backward()
@@ -132,5 +155,6 @@ class EnsembleTrainer:
             bull_loss=float(bull_loss.item()),
             bear_loss=float(bear_loss.item()),
             arbiter_loss=float(arbiter_loss.item()),
+            free_energy=float(free_energy.item()),
             total_steps=self.steps
         )

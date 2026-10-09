@@ -12,6 +12,7 @@ Glues together:
 
 from __future__ import annotations
 import time
+from pathlib import Path
 from dataclasses import dataclass
 import torch
 from config import Config
@@ -78,9 +79,26 @@ class TradingBot:
         self.broker = AlpacaPaperClient(config, dry_run=dry_run)
         self.ledger = TradeLedger(db_path)
 
-        # Warm start neural network weights so it never operates completely random
-        print("[Bot Init] Pre-training neural debate ensemble on warm-start buffer...")
-        run_pretraining(self.bull_net, self.bear_net, self.arbiter_net, epochs=15)
+        # Warm start neural network weights from offline pre-trained checkpoint
+        weights_file = Path(__file__).resolve().parent / "model" / "weights" / "ensemble_pretrained.pt"
+        if weights_file.exists():
+            try:
+                ckpt = torch.load(weights_file, map_location="cpu")
+                if ckpt.get("state_dim") == config.model.state_dim:
+                    self.bull_net.load_state_dict(ckpt["bull_state_dict"])
+                    self.bear_net.load_state_dict(ckpt["bear_state_dict"])
+                    self.arbiter_net.load_state_dict(ckpt["arbiter_state_dict"])
+                    num_theories = len(ckpt.get("metadata", {}).get("theories", []))
+                    print(f"[Bot Init] Loaded pre-trained ensemble checkpoint ({num_theories} quant theories active) from: {weights_file.name}")
+                else:
+                    print(f"[Bot Init] Checkpoint state_dim mismatch, running warm-start pretraining...")
+                    run_pretraining(self.bull_net, self.bear_net, self.arbiter_net, epochs=10, state_dim=config.model.state_dim)
+            except Exception as e:
+                print(f"[Bot Init] Failed loading checkpoint ({e}), running warm-start pretraining...")
+                run_pretraining(self.bull_net, self.bear_net, self.arbiter_net, epochs=10, state_dim=config.model.state_dim)
+        else:
+            print("[Bot Init] Pre-training neural debate ensemble on warm-start buffer...")
+            run_pretraining(self.bull_net, self.bear_net, self.arbiter_net, epochs=15, state_dim=config.model.state_dim)
         print("[Bot Init] Ensemble pre-trained and ready.")
 
     def run_cycle(self) -> CycleSummary:

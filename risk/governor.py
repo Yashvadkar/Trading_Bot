@@ -65,7 +65,8 @@ class RiskGovernor:
         available_cash: float,
         current_positions_count: int,
         is_already_held: bool,
-        circuit_breaker_active: bool
+        circuit_breaker_active: bool,
+        evt_var_99: float = 0.0
     ) -> OrderDirective:
         """Evaluates trade intent and returns an authorized, sized order or rejection."""
         # 1. Action 0: HOLD
@@ -150,11 +151,19 @@ class RiskGovernor:
 
         # Action multiplier: 1 -> 0.5x, 2 -> 1.0x
         scale_factor = 0.5 if action == 1 else 1.0
+        # Extreme Value Theory (EVT) tail-risk dampener: if tail loss > 5%, reduce size by 35%
+        if evt_var_99 > 0.05:
+            scale_factor *= 0.65
+
         risk_budget_pct = self.cfg.max_risk_per_trade * scale_factor
         dollar_risk = portfolio_equity * risk_budget_pct
 
-        # Trailing stop distance = ATR * multiplier
-        stop_dist = max(atr * self.cfg.atr_multiplier_stop, current_price * 0.01)
+        # Trailing stop distance = max(ATR * multiplier, EVT tail risk)
+        base_stop_dist = max(atr * self.cfg.atr_multiplier_stop, current_price * 0.01)
+        if evt_var_99 > 0.0:
+            stop_dist = max(base_stop_dist, current_price * evt_var_99)
+        else:
+            stop_dist = base_stop_dist
         stop_loss_price = max(0.01, current_price - stop_dist)
 
         # Shares to risk exact dollar budget

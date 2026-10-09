@@ -43,7 +43,7 @@ class RiskConfig:
 
 @dataclass(frozen=True)
 class ModelConfig:
-    state_dim: int = 32
+    state_dim: int = 64
     hidden_dim: int = 128
     num_actions: int = 4                    # 0: Hold, 1: Buy 0.5x, 2: Buy 1.0x, 3: Exit
     disagreement_threshold: float = 0.35    # Disagreement delta threshold tau

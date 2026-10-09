@@ -81,7 +81,7 @@ class TestTradingBotPipeline(unittest.TestCase):
             PortfolioContext(),
             DebateMetrics()
         )
-        self.assertEqual(state.shape, (1, 32))
+        self.assertEqual(state.shape, (1, 64))
         self.assertFalse(torch.isnan(state).any())
         self.assertFalse(torch.isinf(state).any())
         self.assertTrue((state >= -3.0).all() and (state <= 3.0).all())
@@ -100,33 +100,34 @@ class TestTradingBotPipeline(unittest.TestCase):
         self.assertTrue(bad.sentiment_score < 0.0)
 
     def test_debate_arena_and_disagreement(self):
-        bull = BullNetwork(state_dim=32, hidden_dim=64)
-        bear = BearNetwork(state_dim=32, hidden_dim=64)
+        bull = BullNetwork(state_dim=64, hidden_dim=64)
+        bear = BearNetwork(state_dim=64, hidden_dim=64)
         arb = ArbiterNetwork(hidden_dim=64)
         arena = DebateArena(bull, bear, arb, disagreement_threshold=0.35)
 
-        state = torch.randn(1, 32)
+        state = torch.randn(1, 64)
         verdict = arena.evaluate_debate(state)
         self.assertIn(verdict.chosen_action, [0, 1, 2, 3])
         self.assertTrue(0.0 <= verdict.action_confidence <= 1.0)
         self.assertTrue(verdict.disagreement_variance >= 0.0)
 
     def test_karpathy_micro_training_convergence(self):
-        bull = BullNetwork(state_dim=32, hidden_dim=64)
-        bear = BearNetwork(state_dim=32, hidden_dim=64)
+        bull = BullNetwork(state_dim=64, hidden_dim=64)
+        bear = BearNetwork(state_dim=64, hidden_dim=64)
         arb = ArbiterNetwork(hidden_dim=64)
         trainer = EnsembleTrainer(bull, bear, arb, lr=2e-3)
         buffer = ReplayBuffer(capacity=50)
 
         for _ in range(8):
-            buffer.push(torch.randn(32), 2, 0.1, torch.randn(32), False, 0.05)
+            buffer.push(torch.randn(64), 2, 0.1, torch.randn(64), False, 0.05)
 
         loss_0 = trainer.train_step(buffer, batch_size=8)
         for _ in range(20):
             loss_final = trainer.train_step(buffer, batch_size=8)
 
-        # Confirm loss decreases
+        # Confirm loss decreases or remains low
         self.assertTrue(loss_final.bull_loss < loss_0.bull_loss or loss_final.bull_loss < 0.5)
+        self.assertTrue(loss_final.free_energy is not None)
 
     def test_risk_governor_sizing_and_limits(self):
         cfg = RiskConfig(max_risk_per_trade=0.015, atr_multiplier_stop=2.0)
@@ -247,6 +248,41 @@ class TestTradingBotPipeline(unittest.TestCase):
             current_stop_price=94.0
         )
         self.assertEqual(hold_dir.action_type, PositionActionType.HOLD)
+
+    def test_risk_governor_evt_tail_dampener(self):
+        cfg = RiskConfig(max_risk_per_trade=0.015, atr_multiplier_stop=2.0)
+        gov = RiskGovernor(cfg)
+
+        # Normal condition without EVT tail risk (ATR=2.0 -> base stop dist=4.0)
+        dir_normal = gov.evaluate_order(
+            ticker="NVDA", action=2, current_price=100.0, atr=2.0,
+            portfolio_equity=100_000.0, available_cash=50_000.0,
+            current_positions_count=0, is_already_held=False,
+            circuit_breaker_active=False, evt_var_99=0.02
+        )
+        # Extreme tail-risk regime: VaR_99 = 0.08 (> base stop dist of 4.0)
+        dir_evt = gov.evaluate_order(
+            ticker="NVDA", action=2, current_price=100.0, atr=2.0,
+            portfolio_equity=100_000.0, available_cash=50_000.0,
+            current_positions_count=0, is_already_held=False,
+            circuit_breaker_active=False, evt_var_99=0.08
+        )
+        self.assertTrue(dir_evt.shares < dir_normal.shares, f"EVT shares ({dir_evt.shares}) must be dampened vs normal ({dir_normal.shares})")
+        self.assertTrue(dir_evt.stop_loss_price < dir_normal.stop_loss_price, "EVT stop price should widen to survive tail turbulence")
+
+    def test_pretrained_checkpoint_loading(self):
+        ckpt_path = Path(__file__).resolve().parent.parent / "model" / "weights" / "ensemble_pretrained.pt"
+        if ckpt_path.exists():
+            ckpt = torch.load(ckpt_path, map_location="cpu")
+            self.assertEqual(ckpt["state_dim"], 64)
+            self.assertIn("bull_state_dict", ckpt)
+            self.assertIn("bear_state_dict", ckpt)
+            self.assertIn("arbiter_state_dict", ckpt)
+
+            bull = BullNetwork(state_dim=64)
+            bull.load_state_dict(ckpt["bull_state_dict"])
+            out_p, out_v, _ = bull(torch.randn(1, 64))
+            self.assertEqual(out_p.shape, (1, 4))
 
 
 if __name__ == "__main__":
