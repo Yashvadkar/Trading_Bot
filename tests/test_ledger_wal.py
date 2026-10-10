@@ -95,6 +95,48 @@ class TestLedgerWAL(unittest.TestCase):
 
         self.assertEqual(len(errors), 0, f"Thread concurrency errors encountered: {errors}")
 
+    def test_sync_batch_write_atomicity(self):
+        queries = [
+            ("INSERT INTO discovery_log (timestamp, ticker, mention_count, sentiment_score, catalysts) VALUES (?, ?, ?, ?, ?)",
+             ("2026-10-10T00:00:00Z", f"BATCH_{i}", 10, 0.9, "momentum"))
+            for i in range(5)
+        ]
+        self.ledger._sync_batch_write(queries)
+        with self.ledger._get_connection() as conn:
+            count = conn.execute("SELECT COUNT(*) FROM discovery_log WHERE ticker LIKE 'BATCH_%';").fetchone()[0]
+            self.assertEqual(count, 5)
+
+    def test_sync_batch_write_rollback_on_error(self):
+        queries = [
+            ("INSERT INTO discovery_log (timestamp, ticker, mention_count, sentiment_score, catalysts) VALUES (?, ?, ?, ?, ?)",
+             ("2026-10-10T00:00:00Z", "ROLLBACK_TEST", 10, 0.9, "momentum")),
+            ("INSERT INTO non_existent_table (col) VALUES (?)", ("error_val",))
+        ]
+        with self.assertRaises(Exception):
+            self.ledger._sync_batch_write(queries)
+
+        with self.ledger._get_connection() as conn:
+            count = conn.execute("SELECT COUNT(*) FROM discovery_log WHERE ticker = 'ROLLBACK_TEST';").fetchone()[0]
+            self.assertEqual(count, 0)
+
+    def test_async_commit_state(self):
+        import asyncio
+
+        async def run_async():
+            queries = [
+                ("INSERT INTO discovery_log (timestamp, ticker, mention_count, sentiment_score, catalysts) VALUES (?, ?, ?, ?, ?)",
+                 ("2026-10-10T00:00:00Z", f"ASYNC_{i}", 15, 0.95, "breakout"))
+                for i in range(3)
+            ]
+            await self.ledger.async_commit_state(queries)
+
+        asyncio.run(run_async())
+
+        with self.ledger._get_connection() as conn:
+            count = conn.execute("SELECT COUNT(*) FROM discovery_log WHERE ticker LIKE 'ASYNC_%';").fetchone()[0]
+            self.assertEqual(count, 3)
+
 
 if __name__ == "__main__":
     unittest.main()
+

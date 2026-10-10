@@ -6,6 +6,7 @@ and executed trade with parameterized SQL statements and clean DAO patterns.
 
 from __future__ import annotations
 import sqlite3
+import asyncio
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -44,6 +45,43 @@ class TradeLedger:
             conn.commit()
         finally:
             conn.close()
+
+    def _sync_batch_write(self, queries: list[tuple[str, tuple]]) -> None:
+        """Strictly synchronous atomic batch write executed within worker thread or caller.
+        
+        Uses BEGIN IMMEDIATE to acquire an immediate write lock, commits on success,
+        rolls back on error, and ensures PRAGMA wal_checkpoint(PASSIVE) in finally block.
+        """
+        if not queries:
+            return
+        conn = sqlite3.connect(self.db_path, timeout=10.0, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.isolation_level = None  # Explicit manual transaction control
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("PRAGMA busy_timeout=5000;")
+        try:
+            conn.execute("BEGIN IMMEDIATE;")
+            for sql, params in queries:
+                conn.execute(sql, params)
+            conn.execute("COMMIT;")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK;")
+            except Exception:
+                pass
+            raise
+        finally:
+            try:
+                conn.execute("PRAGMA wal_checkpoint(PASSIVE);")
+            except Exception:
+                pass
+            conn.close()
+
+    async def async_commit_state(self, queries: list[tuple[str, tuple]]) -> None:
+        """Asynchronously offloads batch write to thread pool executor, maintaining zero-await transaction boundaries."""
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._sync_batch_write, queries)
 
     def _init_schema(self) -> None:
         """Create structured tables with proper indexes."""
@@ -88,11 +126,11 @@ class TradeLedger:
 
     def log_discovery(self, ticker: str, mention_count: int, sentiment_score: float, catalysts: list[str]) -> None:
         ts = datetime.now(timezone.utc).isoformat()
-        with self._get_connection() as conn:
-            conn.execute(
-                "INSERT INTO discovery_log (timestamp, ticker, mention_count, sentiment_score, catalysts) VALUES (?, ?, ?, ?, ?)",
-                (ts, ticker, mention_count, sentiment_score, ",".join(catalysts))
-            )
+        query = (
+            "INSERT INTO discovery_log (timestamp, ticker, mention_count, sentiment_score, catalysts) VALUES (?, ?, ?, ?, ?)",
+            (ts, ticker, mention_count, sentiment_score, ",".join(catalysts))
+        )
+        self._sync_batch_write([query])
 
     def log_debate(
         self,
@@ -104,19 +142,19 @@ class TradeLedger:
         is_approved: bool
     ) -> None:
         ts = datetime.now(timezone.utc).isoformat()
-        with self._get_connection() as conn:
-            conn.execute(
-                "INSERT INTO debate_log (timestamp, ticker, bull_conf, bear_conf, disagreement_var, chosen_action, is_approved) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (ts, ticker, bull_conf, bear_conf, disagreement_var, action, 1 if is_approved else 0)
-            )
+        query = (
+            "INSERT INTO debate_log (timestamp, ticker, bull_conf, bear_conf, disagreement_var, chosen_action, is_approved) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (ts, ticker, bull_conf, bear_conf, disagreement_var, action, 1 if is_approved else 0)
+        )
+        self._sync_batch_write([query])
 
     def log_trade(self, record: TradeRecord) -> None:
         ts = datetime.now(timezone.utc).isoformat()
-        with self._get_connection() as conn:
-            conn.execute(
-                "INSERT INTO trades_log (timestamp, ticker, side, shares, price, stop_loss, order_id, status, realized_pnl) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (ts, record.ticker, record.side, record.shares, record.price, record.stop_loss, record.order_id, record.status, record.realized_pnl)
-            )
+        query = (
+            "INSERT INTO trades_log (timestamp, ticker, side, shares, price, stop_loss, order_id, status, realized_pnl) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (ts, record.ticker, record.side, record.shares, record.price, record.stop_loss, record.order_id, record.status, record.realized_pnl)
+        )
+        self._sync_batch_write([query])
 
     def get_recent_trades(self, limit: int = 10) -> list[dict]:
         """Eagerly drains recent trade records into plain memory dicts to avoid lingering cursor locks."""

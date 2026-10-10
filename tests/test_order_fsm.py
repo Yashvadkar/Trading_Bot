@@ -83,6 +83,51 @@ class TestOrderLifecycleFSM(unittest.TestCase):
             self.assertTrue(success)
             self.assertEqual(client.fsm.get_state("ord_race_123"), OrderState.FILLED)
 
+    def test_force_fsm_reconciliation_direct(self):
+        cid = "bot_force_test"
+        self.fsm.register_order(cid, initial_state=OrderState.NEW)
+        self.fsm.acquire_modification_lock(cid)
+        # Forced reconciliation should override lock and transition to FILLED
+        self.assertTrue(self.fsm.force_fsm_reconciliation(cid, OrderState.FILLED))
+        self.assertEqual(self.fsm.get_state(cid), OrderState.FILLED)
+        self.assertTrue(self.fsm.is_terminal(cid))
+
+    def test_alpaca_update_stop_loss_pessimistic_terminal_skip(self):
+        cfg = load_config()
+        client = AlpacaPaperClient(cfg, dry_run=False)
+        order_id = "ord_terminal_skip"
+        client.fsm.register_order(order_id, initial_state=OrderState.FILLED)
+
+        mock_get_resp = MagicMock()
+        mock_get_resp.status_code = 200
+        mock_get_resp.json.return_value = [{"id": order_id, "type": "stop", "stop_price": "140.0"}]
+
+        with patch.object(client.session, "get", return_value=mock_get_resp), \
+             patch.object(client.session, "patch") as mock_patch:
+            # Because order is already terminal, patch must NOT be called
+            success = client.update_stop_loss("AAPL", 145.0)
+            self.assertFalse(success)
+            mock_patch.assert_not_called()
+
+    def test_alpaca_404_reconciliation(self):
+        cfg = load_config()
+        client = AlpacaPaperClient(cfg, dry_run=False)
+
+        mock_get_resp = MagicMock()
+        mock_get_resp.status_code = 200
+        mock_get_resp.json.return_value = [{"id": "ord_404_test", "type": "stop", "stop_price": "140.0"}]
+
+        mock_patch_resp = MagicMock()
+        mock_patch_resp.status_code = 404
+        mock_patch_resp.text = "order not found"
+
+        with patch.object(client.session, "get", return_value=mock_get_resp), \
+             patch.object(client.session, "patch", return_value=mock_patch_resp):
+            success = client.update_stop_loss("AAPL", 145.0)
+            self.assertTrue(success)
+            self.assertEqual(client.fsm.get_state("ord_404_test"), OrderState.FILLED)
+
 
 if __name__ == "__main__":
     unittest.main()
+

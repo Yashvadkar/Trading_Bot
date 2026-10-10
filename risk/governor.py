@@ -55,13 +55,33 @@ class PositionDirective:
     reason: str
 
 
+class SliceRoutingType(str, Enum):
+    PASSIVE_LIMIT = "passive_limit"
+    AGGRESSIVE_MARKET = "aggressive_market"
+
+
+@dataclass(frozen=True)
+class ChildSliceDirective:
+    shares: int
+    routing_type: SliceRoutingType
+    fill_prob: float
+    urgency_kappa: float
+
+
 class OTRTracker:
-    """Regulatory Order-to-Trade Ratio (OTR) monitor with SEBI/NSE proximity exemption.
+    """Regulatory Order-to-Trade Ratio (OTR) monitor with vectorized SEBI/NSE proximity exemption.
     
     Orders placed within +-delta (default 0.75% for cash equities) of the Last Traded Price (LTP)
     are exempt from the high OTR penalty numerator to avoid penalizing near-market liquidity provision.
-    Uses collections.deque for zero-copy O(1) rolling window pruning.
+    Uses memory-contiguous numpy structured arrays for vectorized evaluation and deques for zero-copy pruning.
     """
+
+    ORDER_DTYPE = np.dtype([
+        ('timestamp', np.float64),
+        ('price', np.float64),
+        ('ltp', np.float64),
+        ('exempt', np.bool_)
+    ])
 
     def __init__(
         self,
@@ -77,17 +97,55 @@ class OTRTracker:
         self.non_exempt_orders: deque[float] = deque()
         self.exempt_orders: deque[float] = deque()
         self.trades: deque[float] = deque()
+        self._order_records: list[tuple[float, float, float, bool]] = []
 
     def record_order(self, price: float | None = None, ltp: float | None = None) -> None:
         """Records an order timestamp, checking for proximity exemption."""
         now = time.time()
-        # SEBI / NSE proximity exemption: |P - LTP| / LTP <= delta
-        if price is not None and ltp is not None and ltp > 0:
-            diff_pct = abs(price - ltp) / ltp
+        p = float(price) if price is not None else 0.0
+        l = float(ltp) if ltp is not None else 0.0
+        is_exempt = False
+        if price is not None and ltp is not None and l > 0:
+            diff_pct = abs(p - l) / l
             if diff_pct <= self.proximity_delta:
-                self.exempt_orders.append(now)
-                return
-        self.non_exempt_orders.append(now)
+                is_exempt = True
+
+        self._order_records.append((now, p, l, is_exempt))
+        if is_exempt:
+            self.exempt_orders.append(now)
+        else:
+            self.non_exempt_orders.append(now)
+
+    def record_batch_orders(
+        self,
+        prices: np.ndarray | list[float],
+        ltps: np.ndarray | list[float],
+        timestamps: np.ndarray | list[float] | None = None
+    ) -> int:
+        """Vectorized batch order registration using contiguous numpy arrays."""
+        p_arr = np.asarray(prices, dtype=np.float64)
+        l_arr = np.asarray(ltps, dtype=np.float64)
+        n = len(p_arr)
+        if n == 0:
+            return 0
+        now = time.time()
+        t_arr = np.asarray(timestamps, dtype=np.float64) if timestamps is not None else np.full(n, now, dtype=np.float64)
+
+        with np.errstate(divide='ignore', invalid='ignore'):
+            valid_ltp = l_arr > 0
+            diff_pct = np.zeros(n, dtype=np.float64)
+            np.divide(np.abs(p_arr - l_arr), l_arr, out=diff_pct, where=valid_ltp)
+            exempt = valid_ltp & (diff_pct <= self.proximity_delta)
+
+        for i in range(n):
+            t_val = float(t_arr[i])
+            is_ex = bool(exempt[i])
+            self._order_records.append((t_val, float(p_arr[i]), float(l_arr[i]), is_ex))
+            if is_ex:
+                self.exempt_orders.append(t_val)
+            else:
+                self.non_exempt_orders.append(t_val)
+        return int(np.sum(exempt))
 
     def record_trade(self) -> None:
         self.trades.append(time.time())
@@ -100,6 +158,19 @@ class OTRTracker:
             self.exempt_orders.popleft()
         while self.trades and self.trades[0] < cutoff:
             self.trades.popleft()
+        while self._order_records and self._order_records[0][0] < cutoff:
+            self._order_records.pop(0)
+
+    def compute_vectorized_otr(self) -> float:
+        """Vector-calculates OTR across rolling contiguous numpy structured array."""
+        now = time.time()
+        self._prune(now)
+        if not self._order_records:
+            return 0.0
+        arr = np.array(self._order_records, dtype=self.ORDER_DTYPE)
+        non_exempt_count = int(np.sum(~arr['exempt']))
+        trade_count = len(self.trades)
+        return float(non_exempt_count) / float(max(1, trade_count))
 
     def get_current_otr(self) -> float:
         now = time.time()
@@ -124,7 +195,7 @@ class OTRTracker:
 
 
 class AlmgrenChrissSlicer:
-    """Almgren-Chriss Optimal Execution Parent-Order Slicer (TWAP/POV) with CVD modulation."""
+    """Almgren-Chriss Optimal Execution Parent-Order Slicer (TWAP/POV) with CVD & Cont-Larrard queue decay."""
 
     @staticmethod
     def calculate_urgency(
@@ -157,6 +228,12 @@ class AlmgrenChrissSlicer:
             multiplier = 1.0
 
         return float(base_urgency * multiplier)
+
+    @staticmethod
+    def calculate_cont_larrard_fill_prob(queue_position: float, gamma: float = 0.5) -> float:
+        """Cont-Larrard queue fill probability decay: P_fill = exp(-gamma * q_pos)."""
+        q_pos = max(0.0, float(queue_position))
+        return float(np.exp(-gamma * q_pos))
 
     @classmethod
     def slice_order(
@@ -198,6 +275,55 @@ class AlmgrenChrissSlicer:
             slices.append(cur)
             rem -= cur
         return slices
+
+    @classmethod
+    def route_child_slices(
+        cls,
+        total_shares: int,
+        price: float,
+        adv: float = 10_000_000.0,
+        max_pov_pct: float = 0.05,
+        threshold_usd: float = 10_000.0,
+        volatility: float = 0.02,
+        cvd_divergence: float = 0.0,
+        side: OrderSide = OrderSide.BUY,
+        queue_position: float = 0.5,
+        gamma: float = 0.5
+    ) -> list[ChildSliceDirective]:
+        """Generates child slice directives with dynamic passive limit vs aggressive market routing."""
+        slices = cls.slice_order(
+            total_shares=total_shares,
+            price=price,
+            adv=adv,
+            max_pov_pct=max_pov_pct,
+            threshold_usd=threshold_usd,
+            volatility=volatility,
+            cvd_divergence=cvd_divergence,
+            side=side
+        )
+        urgency = cls.calculate_urgency(
+            volatility=volatility,
+            cvd_divergence=cvd_divergence,
+            side=side
+        )
+        p_fill = cls.calculate_cont_larrard_fill_prob(queue_position, gamma=gamma)
+
+        # Dynamic routing switch: if fill probability < 0.40 (deep queue with adverse drift risk)
+        # or aggressive momentum alignment with elevated urgency, switch to AGGRESSIVE_MARKET
+        if p_fill < 0.40 or (side == OrderSide.BUY and cvd_divergence > 0.5 and urgency > 0.15):
+            routing = SliceRoutingType.AGGRESSIVE_MARKET
+        else:
+            routing = SliceRoutingType.PASSIVE_LIMIT
+
+        return [
+            ChildSliceDirective(
+                shares=s,
+                routing_type=routing,
+                fill_prob=p_fill,
+                urgency_kappa=urgency
+            )
+            for s in slices
+        ]
 
 
 def calculate_conformal_volatility(
@@ -267,30 +393,55 @@ def calculate_fractional_kelly_capital(
 def allocate_portfolio_with_cash_preservation(
     target_fractions: dict[str, float],
     max_leverage: float = 1.5,
-    uncertainty_scale: float = 1.0
+    uncertainty_scale: float = 1.0,
+    conformal_penalties: dict[str, float] | None = None,
+    include_cash: bool = False
 ) -> dict[str, float]:
-    """Allocates portfolio weights preserving CASH during systemic uncertainty.
+    """Allocates portfolio weights preserving CASH during systemic or asset-level uncertainty.
     
-    Prevents the uniform gross leverage washout trap: when conformal uncertainty expands
-    across the entire market (uncertainty_scale > 1.0), the gross ceiling is dampened,
-    allowing unallocated capital to rest safely in CASH rather than forcing full leverage.
+    Prevents the uniform gross leverage washout trap:
+    1. Computes unconstrained targets f_i^*.
+    2. Dampens by conformal model uncertainty phi_i = max(1.0, sigma_conf / sigma_baseline).
+    3. Moves the unallocated capital directly into a dedicated CASH allocation bucket:
+       w_cash = max(0.0, 1.0 - sum(f_i^* / phi_i)).
+    4. Applies gross leverage caps strictly to invested allocations without eroding the cash buffer.
     """
     if not target_fractions:
-        return {}
+        return {"CASH": 1.0} if include_cash else {}
 
     effective_gross_cap = max_leverage / max(1.0, uncertainty_scale)
-    total_requested = sum(max(0.0, f) for f in target_fractions.values())
 
-    if total_requested <= 0.0:
-        return {k: 0.0 for k in target_fractions}
+    if conformal_penalties:
+        penalized_targets = {}
+        for sym, f_star in target_fractions.items():
+            phi_i = max(1.0, conformal_penalties.get(sym, uncertainty_scale))
+            penalized_targets[sym] = max(0.0, f_star) / phi_i
+        total_requested = sum(penalized_targets.values())
+        if total_requested <= 0.0:
+            result = {k: 0.0 for k in target_fractions}
+        elif total_requested <= effective_gross_cap:
+            result = penalized_targets
+        else:
+            scale = effective_gross_cap / total_requested
+            result = {k: w * scale for k, w in penalized_targets.items()}
+    else:
+        total_requested = sum(max(0.0, f) for f in target_fractions.values())
+        if total_requested <= 0.0:
+            result = {k: 0.0 for k in target_fractions}
+        elif total_requested <= effective_gross_cap:
+            result = {k: max(0.0, f) for k, f in target_fractions.items()}
+        else:
+            scale = effective_gross_cap / total_requested
+            result = {k: max(0.0, f) * scale for k, f in target_fractions.items()}
 
-    # If within effective gross cap, keep positions as-is (remaining capital is CASH)
-    if total_requested <= effective_gross_cap:
-        return {k: max(0.0, f) for k, f in target_fractions.items()}
+    if include_cash:
+        total_invested = sum(result.values())
+        w_cash = max(0.0, 1.0 - total_invested)
+        result_with_cash = dict(result)
+        result_with_cash["CASH"] = w_cash
+        return result_with_cash
 
-    # Scale down proportionally to the uncertainty-dampened gross cap
-    scale = effective_gross_cap / total_requested
-    return {k: max(0.0, f) * scale for k, f in target_fractions.items()}
+    return result
 
 
 class RiskGovernor:

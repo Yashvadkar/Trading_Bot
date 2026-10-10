@@ -167,3 +167,31 @@ class OrderLifecycleFSM:
         self._exchange_to_client[exchange_order_id] = client_order_id
         if client_order_id in self._orders:
             self._orders[client_order_id].exchange_order_id = exchange_order_id
+
+    def force_fsm_reconciliation(
+        self,
+        identifier: str,
+        new_state: OrderState = OrderState.FILLED,
+        reason: str = "matching_engine_reconciliation"
+    ) -> bool:
+        """Forcibly transitions an order to a terminal state (default: FILLED).
+        
+        Invoked when the exchange returns 404 (not found / purged) or 422 (already filled/closed).
+        Bypasses non-terminal state transition checks and clears in-flight modification locks.
+        """
+        record = self._orders.get(identifier)
+        if not record:
+            client_id = self._exchange_to_client.get(identifier)
+            if client_id:
+                record = self._orders.get(client_id)
+
+        now = time.time()
+        if not record:
+            self.register_order(identifier, initial_state=new_state)
+            return True
+
+        record.state = new_state
+        record.in_flight_modification = False
+        record.last_updated = now
+        return True
+

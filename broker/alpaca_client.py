@@ -156,9 +156,13 @@ class AlpacaPaperClient:
                         if not order_id:
                             continue
 
+                        # Pessimistic Check: If already terminal, ignore immediately
+                        if self.fsm.is_terminal(order_id):
+                            continue
+
                         # Check pessimistic modification lock
                         if not self.fsm.acquire_modification_lock(order_id):
-                            # Order is already terminal or modification in flight
+                            # Modification in flight
                             return False
 
                         try:
@@ -170,9 +174,9 @@ class AlpacaPaperClient:
                             if patch_resp.status_code in (200, 201):
                                 return True
                             elif patch_resp.status_code in (404, 422):
-                                # Reconcile race condition: order was filled or canceled before patch landed
-                                print(f"[Alpaca Gateway] Order {order_id} patch returned {patch_resp.status_code}; order closed on exchange.")
-                                self.fsm.transition(order_id, OrderState.FILLED)
+                                # Reconcile race condition: order was filled or closed on exchange
+                                print(f"[Alpaca Gateway] Order {order_id} patch returned {patch_resp.status_code}; reconciling exchange state to FILLED.")
+                                self.fsm.force_fsm_reconciliation(order_id, OrderState.FILLED)
                                 return True
                             else:
                                 return False

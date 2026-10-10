@@ -278,7 +278,15 @@ class TradingBot:
             if directive.is_authorized:
                 authorized_count += 1
                 if len(directive.child_slices) > 1:
-                    print(f"[Almgren-Chriss] Sliced parent order of {directive.shares} shares into {len(directive.child_slices)} TWAP/POV blocks: {directive.child_slices}")
+                    child_routes = self.governor.slicer.route_child_slices(
+                        total_shares=directive.shares,
+                        price=directive.limit_price,
+                        adv=10_000_000.0,
+                        cvd_divergence=cvd_div,
+                        side=directive.side
+                    )
+                    route_summary = [f"{c.shares}sh ({c.routing_type.value}, P_fill={c.fill_prob:.2f})" for c in child_routes]
+                    print(f"[Almgren-Chriss] Sliced parent order into {len(child_routes)} dynamic blocks: {route_summary}")
 
                 print(
                     f"[Risk Governor: APPROVED] {directive.side.value.upper()} {directive.shares} shares of {directive.ticker} "

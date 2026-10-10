@@ -63,24 +63,32 @@ class QuantTheoryEngine:
     # 1. Random Matrix Theory (RMT) — Marčenko–Pastur Spectral Denoising
     # =========================================================================
     @staticmethod
-    def denoise_correlation_matrix_rmt(returns: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
-        """Filters noise eigenvalues using the analytical Marčenko–Pastur law.
+    def clean_correlation_rmt(
+        returns: np.ndarray,
+        clip_floor: float = 1e-8,
+        shrinkage_weight: float = 0.05
+    ) -> tuple[np.ndarray, np.ndarray, float]:
+        """Filters noise eigenvalues using the analytical Marčenko–Pastur law and Ledoit-Wolf shrinkage.
         
-        Given T observations and N assets, sample correlation eigenvalues below:
-            lambda_+ = sigma^2 * (1 + sqrt(N/T))^2
-        represent pure random noise. We retain signal eigenvalues > lambda_+
-        and replace the noise bulk with their trace-preserving average.
+        Given T observations and N assets:
+            q = T / N
+            lambda_+ = sigma^2 * (1 + sqrt(1 / q))^2
+        Under scoped np.errstate, clips eigenvalues to floor, shrinks noise eigenvalues to their mean,
+        reconstructs cleaned correlation matrix, and applies Ledoit-Wolf structural shrinkage:
+            C_shrunk = (1 - alpha) * C_clean + alpha * I
         
         Args:
             returns: Array of shape (T, N) where T >= N
+            clip_floor: Minimum eigenvalue threshold
+            shrinkage_weight: Ledoit-Wolf shrinkage coefficient alpha (default: 0.05)
             
         Returns:
-            (cleaned_corr, top_eigenvalues, noise_ratio)
+            (shrunk_corr, top_eigenvalues, noise_ratio)
         """
         returns = np.asarray(returns, dtype=np.float64)
-        T, N = returns.shape
-        if T < 2 or N < 2:
-            return np.eye(N), np.ones(min(N, 4)), 0.0
+        t_obs, n_assets = returns.shape
+        if t_obs < 2 or n_assets < 2:
+            return np.eye(n_assets), np.ones(min(n_assets, 4)), 0.0
 
         # Empirical correlation matrix
         corr = np.corrcoef(returns, rowvar=False)
@@ -89,47 +97,50 @@ class QuantTheoryEngine:
 
         # Eigen-decomposition (Hermitian / symmetric)
         eigenvalues, eigenvectors = np.linalg.eigh(corr)
-        # Sort descending and clip small/negative eigenvalues to positive floor
         idx = np.argsort(eigenvalues)[::-1]
-        eigenvalues = np.clip(eigenvalues[idx], a_min=1e-8, a_max=None)
+        eigenvalues = eigenvalues[idx]
         eigenvectors = eigenvectors[:, idx]
 
-        # Marčenko-Pastur upper bound: q = N / T, variance sigma^2 ~ 1 for normalized returns
-        q = float(N) / float(T)
-        lambda_plus = (1.0 + math.sqrt(q)) ** 2
-        lambda_minus = (1.0 - math.sqrt(q)) ** 2
+        # Marčenko-Pastur upper bound: q = T / N, lambda_+ = sigma^2 * (1 + sqrt(1/q))^2
+        q = float(t_obs) / float(n_assets)
+        lambda_plus = (1.0 + np.sqrt(1.0 / q)) ** 2
 
-        # Identify noise eigenvalues
-        is_noise = (eigenvalues <= lambda_plus)
-        signal_count = np.sum(~is_noise)
-
-        cleaned_eigenvalues = eigenvalues.copy()
-        if np.any(is_noise):
-            noise_mean = float(np.mean(eigenvalues[is_noise]))
-            cleaned_eigenvalues[is_noise] = max(noise_mean, 1e-8)
-
-        # Scoped numerical context for matrix reconstruction and diagonal rescaling
         with np.errstate(divide='ignore', invalid='ignore'):
+            clipped_eigvals = np.clip(eigenvalues, a_min=clip_floor, a_max=None)
+            is_noise = (clipped_eigvals <= lambda_plus)
+            if np.any(is_noise):
+                noise_mean = float(np.mean(clipped_eigvals[is_noise]))
+                clipped_eigvals[is_noise] = max(noise_mean, clip_floor)
+
             # Reconstruct cleaned correlation matrix: C = V * Lambda * V^T
-            cleaned_corr = eigenvectors @ np.diag(cleaned_eigenvalues) @ eigenvectors.T
+            cleaned_corr = eigenvectors @ np.diag(clipped_eigvals) @ eigenvectors.T
             # Rescale diagonals to strictly 1.0
-            d = np.sqrt(np.maximum(np.diag(cleaned_corr), 1e-8))
+            d = np.sqrt(np.maximum(np.diag(cleaned_corr), clip_floor))
             d_outer = np.outer(d, d)
             cleaned_corr = np.divide(cleaned_corr, d_outer, out=np.zeros_like(cleaned_corr), where=(d_outer > 0))
             np.fill_diagonal(cleaned_corr, 1.0)
 
             # Post-clipping Ledoit-Wolf structured shrinkage toward Identity
             # Guarantees strict positive definiteness and bounds condition number
-            alpha_shrink = 0.05
-            cleaned_corr = (1.0 - alpha_shrink) * cleaned_corr + alpha_shrink * np.eye(N)
-            np.fill_diagonal(cleaned_corr, 1.0)
+            shrunk_corr = (1.0 - shrinkage_weight) * cleaned_corr + shrinkage_weight * np.eye(n_assets)
+            np.fill_diagonal(shrunk_corr, 1.0)
 
-        noise_ratio = float(np.sum(is_noise)) / float(N)
-        top_evals = cleaned_eigenvalues[:min(N, 4)]
+        noise_ratio = float(np.sum(is_noise)) / float(n_assets)
+        top_evals = clipped_eigvals[:min(n_assets, 4)]
         if len(top_evals) < 4:
             top_evals = np.pad(top_evals, (0, 4 - len(top_evals)), constant_values=1.0)
 
-        return cleaned_corr, top_evals, noise_ratio
+        return shrunk_corr, top_evals, noise_ratio
+
+    @classmethod
+    def denoise_correlation_matrix_rmt(
+        cls,
+        returns: np.ndarray,
+        clip_floor: float = 1e-8,
+        shrinkage_weight: float = 0.05
+    ) -> tuple[np.ndarray, np.ndarray, float]:
+        """Backward-compatible entry point delegating to clean_correlation_rmt."""
+        return cls.clean_correlation_rmt(returns, clip_floor=clip_floor, shrinkage_weight=shrinkage_weight)
 
     # =========================================================================
     # 2. Path Signatures (Rough Path Theory) — Iterated Integrals & Lévy Area
@@ -206,44 +217,45 @@ class QuantTheoryEngine:
         if N < min_window * 3:
             return 0.5, 0.0
 
-        returns = np.diff(np.log(np.maximum(arr, 1e-6)))
-        if len(returns) < min_window:
-            return 0.5, 0.0
+        with np.errstate(divide='ignore', invalid='ignore'):
+            returns = np.diff(np.log(np.maximum(arr, 1e-6)))
+            if len(returns) < min_window:
+                return 0.5, 0.0
 
-        # Sub-window scales
-        scales = []
-        rs_values = []
-        max_scale = N // 2
-        curr_scale = min_window
+            # Sub-window scales
+            scales = []
+            rs_values = []
+            max_scale = N // 2
+            curr_scale = min_window
 
-        while curr_scale <= max_scale:
-            num_chunks = len(returns) // curr_scale
-            rs_chunk_list = []
-            for i in range(num_chunks):
-                chunk = returns[i * curr_scale : (i + 1) * curr_scale]
-                mean_adj = chunk - np.mean(chunk)
-                cum_dev = np.cumsum(mean_adj)
-                R = np.max(cum_dev) - np.min(cum_dev)
-                S = np.std(chunk)
-                if S > 1e-8:
-                    rs_chunk_list.append(R / S)
-            if rs_chunk_list:
-                scales.append(curr_scale)
-                rs_values.append(np.mean(rs_chunk_list))
-            curr_scale = int(curr_scale * 1.5) + 1
+            while curr_scale <= max_scale:
+                num_chunks = len(returns) // curr_scale
+                rs_chunk_list = []
+                for i in range(num_chunks):
+                    chunk = returns[i * curr_scale : (i + 1) * curr_scale]
+                    mean_adj = chunk - np.mean(chunk)
+                    cum_dev = np.cumsum(mean_adj)
+                    R = np.max(cum_dev) - np.min(cum_dev)
+                    S = np.std(chunk)
+                    if S > 1e-8:
+                        rs_chunk_list.append(R / S)
+                if rs_chunk_list:
+                    scales.append(curr_scale)
+                    rs_values.append(np.mean(rs_chunk_list))
+                curr_scale = int(curr_scale * 1.5) + 1
 
-        if len(scales) < 3:
-            return 0.5, 0.0
+            if len(scales) < 3:
+                return 0.5, 0.0
 
-        # Linear regression: log(R/S) = H * log(n) + c
-        log_scales = np.log(scales)
-        log_rs = np.log(rs_values)
-        poly = np.polyfit(log_scales, log_rs, 1)
-        H = float(np.clip(poly[0], 0.05, 0.95))
+            # Linear regression: log(R/S) = H * log(n) + c
+            log_scales = np.log(scales)
+            log_rs = np.log(rs_values)
+            poly = np.polyfit(log_scales, log_rs, 1)
+            H = float(np.clip(poly[0], 0.05, 0.95))
 
-        # Local Lyapunov exponent proxy: rate of exponential divergence of nearby returns
-        diffs = np.abs(np.diff(returns))
-        lyapunov_proxy = float(np.clip(np.mean(np.log(np.maximum(diffs, 1e-6))) + 5.0, -3.0, 3.0))
+            # Local Lyapunov exponent proxy: rate of exponential divergence of nearby returns
+            diffs = np.abs(np.diff(returns))
+            lyapunov_proxy = float(np.clip(np.mean(np.log(np.maximum(diffs, 1e-6))) + 5.0, -3.0, 3.0))
 
         return H, lyapunov_proxy
 
@@ -366,20 +378,21 @@ class QuantTheoryEngine:
         joint_2d_yx /= N
         marg_y /= N
 
-        te = 0.0
-        for yn in range(bins):
-            for yp in range(bins):
-                for xp in range(bins):
-                    p_yn_yp_xp = joint_3d[yn, yp, xp]
-                    p_yp_xp = joint_2d_yx[yp, xp]
-                    p_yn_yp = joint_2d_yy[yn, yp]
-                    p_yp = marg_y[yp]
+        with np.errstate(divide='ignore', invalid='ignore'):
+            te = 0.0
+            for yn in range(bins):
+                for yp in range(bins):
+                    for xp in range(bins):
+                        p_yn_yp_xp = joint_3d[yn, yp, xp]
+                        p_yp_xp = joint_2d_yx[yp, xp]
+                        p_yn_yp = joint_2d_yy[yn, yp]
+                        p_yp = marg_y[yp]
 
-                    if p_yn_yp_xp > 1e-7 and p_yp_xp > 1e-7 and p_yn_yp > 1e-7 and p_yp > 1e-7:
-                        # p(yn | yp, xp) / p(yn | yp) = (p_yn_yp_xp / p_yp_xp) / (p_yn_yp / p_yp)
-                        cond_ratio = (p_yn_yp_xp * p_yp) / (p_yp_xp * p_yn_yp)
-                        if cond_ratio > 0:
-                            te += p_yn_yp_xp * math.log2(cond_ratio)
+                        if p_yn_yp_xp > 1e-7 and p_yp_xp > 1e-7 and p_yn_yp > 1e-7 and p_yp > 1e-7:
+                            # p(yn | yp, xp) / p(yn | yp) = (p_yn_yp_xp / p_yp_xp) / (p_yn_yp / p_yp)
+                            cond_ratio = (p_yn_yp_xp * p_yp) / (p_yp_xp * p_yn_yp)
+                            if cond_ratio > 0:
+                                te += p_yn_yp_xp * math.log2(cond_ratio)
 
         return float(np.clip(te, 0.0, 3.0))
 
@@ -450,24 +463,25 @@ class QuantTheoryEngine:
         if len(arr) < window:
             return 0.0, 0.0
 
-        recent = arr[-window:]
-        recent_detrend = recent - np.mean(recent)
-        var_now = float(np.var(recent_detrend))
+        with np.errstate(divide='ignore', invalid='ignore'):
+            recent = arr[-window:]
+            recent_detrend = recent - np.mean(recent)
+            var_now = float(np.var(recent_detrend))
 
-        if len(arr) >= 2 * window:
-            prev = arr[-2 * window : -window]
-            prev_detrend = prev - np.mean(prev)
-            var_prev = float(np.var(prev_detrend))
-            var_accel = (var_now - var_prev) / (var_prev + 1e-6)
-        else:
-            var_accel = 0.0
+            if len(arr) >= 2 * window:
+                prev = arr[-2 * window : -window]
+                prev_detrend = prev - np.mean(prev)
+                var_prev = float(np.var(prev_detrend))
+                var_accel = (var_now - var_prev) / (var_prev + 1e-6)
+            else:
+                var_accel = 0.0
 
-        # Lag-1 Autocorrelation
-        if var_now > 1e-8:
-            autocorr_1 = np.corrcoef(recent_detrend[:-1], recent_detrend[1:])[0, 1]
-            autocorr_1 = float(np.nan_to_num(autocorr_1, nan=0.0))
-        else:
-            autocorr_1 = 0.0
+            # Lag-1 Autocorrelation
+            if var_now > 1e-8:
+                autocorr_1 = np.corrcoef(recent_detrend[:-1], recent_detrend[1:])[0, 1]
+                autocorr_1 = float(np.nan_to_num(autocorr_1, nan=0.0))
+            else:
+                autocorr_1 = 0.0
 
         return float(np.clip(autocorr_1, -1.0, 1.0)), float(np.clip(var_accel, -2.0, 3.0))
 
@@ -486,29 +500,30 @@ class QuantTheoryEngine:
         if len(ret) < window:
             return 0.5, 0.0
 
-        # 2D Takens delay embedding: (r_t, r_{t-1})
-        sub = ret[-window:]
-        points = np.column_stack([sub[:-1], sub[1:]])  # Shape (window-1, 2)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            # 2D Takens delay embedding: (r_t, r_{t-1})
+            sub = ret[-window:]
+            points = np.column_stack([sub[:-1], sub[1:]])  # Shape (window-1, 2)
 
-        # Pairwise Euclidean distance matrix
-        diff = points[:, np.newaxis, :] - points[np.newaxis, :, :]
-        dists = np.sqrt(np.sum(diff ** 2, axis=-1))
+            # Pairwise Euclidean distance matrix
+            diff = points[:, np.newaxis, :] - points[np.newaxis, :, :]
+            dists = np.sqrt(np.sum(diff ** 2, axis=-1))
 
-        # Topological entropy of persistence scale distribution
-        triu_dists = dists[np.triu_indices_from(dists, k=1)]
-        if len(triu_dists) > 0 and np.sum(triu_dists) > 0:
-            p_dist = triu_dists / np.sum(triu_dists)
-            p_dist = p_dist[p_dist > 1e-6]
-            topological_entropy = -float(np.sum(p_dist * np.log2(p_dist))) / math.log2(len(triu_dists))
-        else:
-            topological_entropy = 0.5
+            # Topological entropy of persistence scale distribution
+            triu_dists = dists[np.triu_indices_from(dists, k=1)]
+            if len(triu_dists) > 0 and np.sum(triu_dists) > 0:
+                p_dist = triu_dists / np.sum(triu_dists)
+                p_dist = p_dist[p_dist > 1e-6]
+                topological_entropy = -float(np.sum(p_dist * np.log2(p_dist))) / math.log2(len(triu_dists))
+            else:
+                topological_entropy = 0.5
 
-        # Wasserstein morphological distance vs older reference window
-        if len(ret) >= 2 * window:
-            ref_sub = ret[-2 * window : -window]
-            w_dist = float(np.abs(np.mean(sub) - np.mean(ref_sub)) + np.abs(np.std(sub) - np.std(ref_sub)))
-        else:
-            w_dist = 0.0
+            # Wasserstein morphological distance vs older reference window
+            if len(ret) >= 2 * window:
+                ref_sub = ret[-2 * window : -window]
+                w_dist = float(np.abs(np.mean(sub) - np.mean(ref_sub)) + np.abs(np.std(sub) - np.std(ref_sub)))
+            else:
+                w_dist = 0.0
 
         return float(np.clip(topological_entropy, 0.0, 1.0)), float(np.clip(w_dist * 50.0, 0.0, 3.0))
 

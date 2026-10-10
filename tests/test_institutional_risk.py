@@ -18,7 +18,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from config import RiskConfig
 from risk.governor import (
     RiskGovernor, OTRTracker, AlmgrenChrissSlicer,
-    calculate_fractional_kelly_capital, OrderSide
+    calculate_fractional_kelly_capital, OrderSide,
+    SliceRoutingType, ChildSliceDirective
 )
 
 
@@ -136,6 +137,56 @@ class TestInstitutionalRisk(unittest.TestCase):
         self.assertFalse(safe2)
         self.assertIn("OTR Regulatory Kill-Switch engaged", msg2)
 
+    def test_vectorized_otr_burst_processing(self):
+        tracker = OTRTracker(soft_limit=35.0, kill_limit=45.0, proximity_delta=0.0075)
+        # Create 120 orders: 70 near-market (within 0.5%), 50 off-market (3% away)
+        prices = np.concatenate([
+            np.full(70, 100.40),  # diff 0.40 / 100 = 0.4% <= 0.75% -> exempt
+            np.full(50, 103.00),  # diff 3.00 / 100 = 3.0% > 0.75% -> non-exempt
+        ])
+        ltps = np.full(120, 100.00)
+
+        exempt_count = tracker.record_batch_orders(prices, ltps)
+        self.assertEqual(exempt_count, 70)
+        self.assertEqual(len(tracker.exempt_orders), 70)
+        self.assertEqual(len(tracker.non_exempt_orders), 50)
+
+        # Record 2 executed trades -> OTR should be 50 / 2 = 25.0
+        tracker.record_trade()
+        tracker.record_trade()
+        self.assertEqual(tracker.compute_vectorized_otr(), 25.0)
+        self.assertEqual(tracker.get_current_otr(), 25.0)
+
+    def test_cont_larrard_queue_decay_and_dynamic_routing(self):
+        # 1. Fill probability decay test
+        p_shallow = AlmgrenChrissSlicer.calculate_cont_larrard_fill_prob(queue_position=0.2, gamma=0.5)
+        p_deep = AlmgrenChrissSlicer.calculate_cont_larrard_fill_prob(queue_position=2.5, gamma=0.5)
+        self.assertGreater(p_shallow, 0.85)
+        self.assertLess(p_deep, 0.35)
+
+        # 2. Shallow queue -> PASSIVE_LIMIT routing
+        directives_shallow = AlmgrenChrissSlicer.route_child_slices(
+            total_shares=1000,
+            price=100.0,
+            adv=500_000.0,
+            queue_position=0.2
+        )
+        self.assertTrue(len(directives_shallow) > 1)
+        self.assertEqual(directives_shallow[0].routing_type, SliceRoutingType.PASSIVE_LIMIT)
+        self.assertGreater(directives_shallow[0].fill_prob, 0.85)
+
+        # 3. Deep queue (P_fill < 0.40) -> AGGRESSIVE_MARKET routing to avoid shortfall drift
+        directives_deep = AlmgrenChrissSlicer.route_child_slices(
+            total_shares=1000,
+            price=100.0,
+            adv=500_000.0,
+            queue_position=2.5
+        )
+        self.assertTrue(len(directives_deep) > 1)
+        self.assertEqual(directives_deep[0].routing_type, SliceRoutingType.AGGRESSIVE_MARKET)
+        self.assertLess(directives_deep[0].fill_prob, 0.40)
+
 
 if __name__ == "__main__":
     unittest.main()
+

@@ -76,6 +76,22 @@ class TestConformalKelly(unittest.TestCase):
         # Verify positions scaled down proportionally and CASH increased
         self.assertLess(stressed_alloc["AAPL"], 0.40)
 
+    def test_dedicated_cash_bucket_conformal_penalties(self):
+        targets = {"AAPL": 0.30, "NVDA": 0.40}
+        # NVDA has high uncertainty (phi = 2.0), AAPL has baseline uncertainty (phi = 1.0)
+        penalties = {"AAPL": 1.0, "NVDA": 2.0}
+        alloc = allocate_portfolio_with_cash_preservation(
+            targets, max_leverage=1.5, conformal_penalties=penalties, include_cash=True
+        )
+        # AAPL: 0.30 / 1.0 = 0.30; NVDA: 0.40 / 2.0 = 0.20
+        # Total invested = 0.50 <= 1.5; CASH = 1.0 - 0.50 = 0.50
+        self.assertIn("CASH", alloc)
+        self.assertAlmostEqual(alloc["AAPL"], 0.30)
+        self.assertAlmostEqual(alloc["NVDA"], 0.20)
+        self.assertAlmostEqual(alloc["CASH"], 0.50)
+        self.assertAlmostEqual(sum(alloc.values()), 1.00)
+
 
 if __name__ == "__main__":
     unittest.main()
+

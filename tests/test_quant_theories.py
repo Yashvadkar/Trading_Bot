@@ -169,6 +169,21 @@ class TestQuantTheoryEngine(unittest.TestCase):
         self.assertTrue(-1.0 <= cvd <= 1.0)
         self.assertIn(div, (-1.0, 0.0, 1.0))
 
+    def test_clean_correlation_rmt_api(self):
+        # Explicit test for clean_correlation_rmt with custom parameters
+        T, N = 150, 8
+        np.random.seed(123)
+        returns = np.random.normal(0, 0.015, (T, N))
+        shrunk_corr, top_evals, noise_ratio = QuantTheoryEngine.clean_correlation_rmt(
+            returns, clip_floor=1e-7, shrinkage_weight=0.08
+        )
+        self.assertEqual(shrunk_corr.shape, (N, N))
+        np.testing.assert_allclose(np.diag(shrunk_corr), 1.0, atol=1e-5)
+        evals = np.linalg.eigvalsh(shrunk_corr)
+        self.assertTrue((evals > 0).all())
+        self.assertFalse(np.isnan(shrunk_corr).any())
+
 
 if __name__ == "__main__":
     unittest.main()
+

@@ -13,6 +13,7 @@ from pathlib import Path
 import time
 import numpy as np
 import yfinance as yf
+from dataclasses import dataclass
 from features.indicators import extract_technicals
 from features.quant_theories import QuantTheoryEngine
 from features.normalizer import StateNormalizer, FundamentalMetrics, MicrostructureMetrics, PortfolioContext, DebateMetrics
@@ -22,6 +23,14 @@ from model.replay_buffer import ReplayBuffer
 class TemporalFiltrationError(Exception):
     """Raised when an information set violates the natural filtration condition (I_t not in F_t)."""
     pass
+
+
+@dataclass(frozen=True)
+class PITDatum:
+    """Statically typed point-in-time observation with explicit operational availability stamp."""
+    event_timestamp: float
+    available_timestamp: float  # Operational availability stamp av in T
+    value: float
 
 
 class HistoricalDataLoader:
@@ -65,6 +74,25 @@ class HistoricalDataLoader:
                 f"Natural filtration violation: Feature data max index ({data_max_index}) >= "
                 f"decision time index ({decision_index}). Future data leaked into current state!"
             )
+        return True
+
+    @staticmethod
+    def filter_pit_sequence(data: list[PITDatum], decision_timestamp: float) -> list[PITDatum]:
+        """Filters an input sequence of PITDatum to strictly those with available_timestamp <= decision_timestamp.
+        
+        Guarantees natural filtration I_t subset of F_t at the type level.
+        """
+        return [d for d in data if d.available_timestamp <= decision_timestamp]
+
+    @staticmethod
+    def assert_pit_filtration(data: list[PITDatum], decision_timestamp: float) -> bool:
+        """Type-level validation that every record in data satisfies available_timestamp <= decision_timestamp."""
+        for d in data:
+            if d.available_timestamp > decision_timestamp:
+                raise TemporalFiltrationError(
+                    f"Point-In-Time Filtration Violation: Datum with available_timestamp {d.available_timestamp} > "
+                    f"decision_timestamp {decision_timestamp}. Event timestamp: {d.event_timestamp}"
+                )
         return True
 
     def fetch_historical_ohlcv(
