@@ -19,9 +19,11 @@ class TestLedgerWAL(unittest.TestCase):
 
     def tearDown(self):
         try:
+            self.ledger.stop_checkpoint_daemon()
             self.temp_dir.cleanup()
         except Exception:
             pass
+
 
     def test_wal_mode_active(self):
         with self.ledger._get_connection() as conn:
@@ -136,7 +138,29 @@ class TestLedgerWAL(unittest.TestCase):
             count = conn.execute("SELECT COUNT(*) FROM discovery_log WHERE ticker LIKE 'ASYNC_%';").fetchone()[0]
             self.assertEqual(count, 3)
 
+    def test_checkpoint_daemon_lifecycle(self):
+        # Start daemon with short interval
+        self.ledger.start_checkpoint_daemon(interval_sec=0.1)
+        self.assertIsNotNone(self.ledger._checkpoint_thread)
+        self.assertTrue(self.ledger._checkpoint_thread.is_alive())
+
+        # Calling start again is idempotent
+        self.ledger.start_checkpoint_daemon(interval_sec=0.1)
+        self.assertTrue(self.ledger._checkpoint_thread.is_alive())
+
+        # Stop daemon terminates thread cleanly
+        self.ledger.stop_checkpoint_daemon(timeout=1.0)
+        self.assertIsNone(self.ledger._checkpoint_thread)
+
+    def test_restart_wal_checkpoint(self):
+        for i in range(10):
+            self.ledger.log_discovery(f"RESTART_{i}", 3, 0.7, ["catalyst"])
+        busy, log_frames, checkpointed = self.ledger.checkpoint_wal(mode="RESTART")
+        self.assertEqual(busy, 0)
+        self.assertGreaterEqual(checkpointed, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
+
 

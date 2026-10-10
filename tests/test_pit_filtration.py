@@ -56,7 +56,35 @@ class TestPITFiltration(unittest.TestCase):
         with self.assertRaises(TemporalFiltrationError):
             HistoricalDataLoader.assert_pit_filtration(data, decision_timestamp=t_decision)
 
+    def test_constituent_delisting_tracking(self):
+        delistings = HistoricalDataLoader.CONSTITUENT_DELISTING
+        self.assertIn("TWTR", delistings)
+        self.assertEqual(delistings["TWTR"], "2022-10-27")
+        self.assertEqual(delistings["LEHM"], "2008-09-15")
+        self.assertIsNone(delistings["NVDA"])
+
+    def test_is_constituent_tradable_window(self):
+        # TWTR inception: 2013-11-07, delisting: 2022-10-27
+        self.assertFalse(HistoricalDataLoader.is_constituent_tradable("TWTR", "2010-01-01"))
+        self.assertTrue(HistoricalDataLoader.is_constituent_tradable("TWTR", "2020-05-01"))
+        self.assertFalse(HistoricalDataLoader.is_constituent_tradable("TWTR", "2023-01-01"))
+
+        # NVDA is active today and was incepted in 1999
+        self.assertFalse(HistoricalDataLoader.is_constituent_tradable("NVDA", "1990-01-01"))
+        self.assertTrue(HistoricalDataLoader.is_constituent_tradable("NVDA", "2026-01-01"))
+
+    def test_filter_active_universe(self):
+        test_universe = ["NVDA", "TWTR", "TSLA", "LEHM"]
+        # As of 2005-01-01: NVDA and LEHM active; TWTR and TSLA not yet born
+        univ_2005 = HistoricalDataLoader.filter_active_universe(test_universe, "2005-01-01")
+        self.assertEqual(set(univ_2005), {"NVDA", "LEHM"})
+
+        # As of 2024-01-01: NVDA and TSLA active; TWTR and LEHM delisted
+        univ_2024 = HistoricalDataLoader.filter_active_universe(test_universe, "2024-01-01")
+        self.assertEqual(set(univ_2024), {"NVDA", "TSLA"})
+
 
 if __name__ == "__main__":
     unittest.main()
+
 

@@ -235,6 +235,17 @@ class AlmgrenChrissSlicer:
         q_pos = max(0.0, float(queue_position))
         return float(np.exp(-gamma * q_pos))
 
+    @staticmethod
+    def recalculate_urgency_on_spread_crossing(current_urgency: float, spread_penalty: float = 0.25) -> float:
+        """Dynamically throttles execution urgency for remaining inventory after crossing the spread.
+        
+        eta_adj = eta * (1 + spread_penalty)
+        kappa_adj = kappa / sqrt(1 + spread_penalty)
+        Throttles subsequent slices to avoid compounding market impact and adverse selection.
+        """
+        penalty = max(0.0, float(spread_penalty))
+        return float(current_urgency / np.sqrt(1.0 + penalty))
+
     @classmethod
     def slice_order(
         cls,
@@ -315,15 +326,21 @@ class AlmgrenChrissSlicer:
         else:
             routing = SliceRoutingType.PASSIVE_LIMIT
 
-        return [
-            ChildSliceDirective(
-                shares=s,
-                routing_type=routing,
-                fill_prob=p_fill,
-                urgency_kappa=urgency
+        directives = []
+        current_urgency = urgency
+        for s in slices:
+            directives.append(
+                ChildSliceDirective(
+                    shares=s,
+                    routing_type=routing,
+                    fill_prob=p_fill,
+                    urgency_kappa=current_urgency
+                )
             )
-            for s in slices
-        ]
+            if routing == SliceRoutingType.AGGRESSIVE_MARKET:
+                current_urgency = cls.recalculate_urgency_on_spread_crossing(current_urgency)
+
+        return directives
 
 
 def calculate_conformal_volatility(

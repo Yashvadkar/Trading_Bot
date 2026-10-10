@@ -185,6 +185,31 @@ class TestInstitutionalRisk(unittest.TestCase):
         self.assertTrue(len(directives_deep) > 1)
         self.assertEqual(directives_deep[0].routing_type, SliceRoutingType.AGGRESSIVE_MARKET)
         self.assertLess(directives_deep[0].fill_prob, 0.40)
+        # Verify subsequent child slices decay urgency upon aggressive spread crossing
+        self.assertGreater(directives_deep[0].urgency_kappa, directives_deep[1].urgency_kappa)
+        if len(directives_deep) > 2:
+            self.assertGreater(directives_deep[1].urgency_kappa, directives_deep[2].urgency_kappa)
+
+    def test_almgren_chriss_dynamic_urgency_decay_on_spread_crossing(self):
+        base_urgency = 0.50
+        penalty = 0.25
+        adj_urgency = AlmgrenChrissSlicer.recalculate_urgency_on_spread_crossing(
+            current_urgency=base_urgency,
+            spread_penalty=penalty
+        )
+        expected = base_urgency / np.sqrt(1.0 + penalty)
+        self.assertAlmostEqual(adj_urgency, expected, places=6)
+        self.assertLess(adj_urgency, base_urgency)
+
+        # Passive shallow queue keeps uniform urgency across all slices
+        directives_passive = AlmgrenChrissSlicer.route_child_slices(
+            total_shares=1000,
+            price=100.0,
+            adv=500_000.0,
+            queue_position=0.1
+        )
+        kappas = [d.urgency_kappa for d in directives_passive]
+        self.assertTrue(all(k == kappas[0] for k in kappas))
 
 
 if __name__ == "__main__":

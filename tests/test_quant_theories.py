@@ -183,6 +183,37 @@ class TestQuantTheoryEngine(unittest.TestCase):
         self.assertTrue((evals > 0).all())
         self.assertFalse(np.isnan(shrunk_corr).any())
 
+    def test_dynamic_ledoit_wolf_shrinkage(self):
+        np.random.seed(42)
+        T, N = 100, 6
+        # Generate ill-conditioned returns with collinearity
+        factor = np.random.normal(0, 0.02, (T, 1))
+        noise = np.random.normal(0, 0.001, (T, N))
+        returns = factor + noise
+
+        raw_corr = np.corrcoef(returns, rowvar=False)
+        cond_raw = np.linalg.cond(raw_corr)
+
+        shrunk_dyn, top_dyn, noise_dyn = QuantTheoryEngine.clean_correlation_rmt(
+            returns, dynamic_shrinkage=True
+        )
+        cond_dyn = np.linalg.cond(shrunk_dyn)
+
+        # Dynamic shrinkage and RMT denoising should strictly improve condition number
+        self.assertLess(cond_dyn, cond_raw)
+        self.assertEqual(shrunk_dyn.shape, (N, N))
+        np.testing.assert_allclose(np.diag(shrunk_dyn), 1.0, atol=1e-5)
+        evals_dyn = np.linalg.eigvalsh(shrunk_dyn)
+        self.assertTrue((evals_dyn > 0).all())
+
+        # Test static fallback when dynamic_shrinkage=False
+        shrunk_stat, _, _ = QuantTheoryEngine.clean_correlation_rmt(
+            returns, shrinkage_weight=0.15, dynamic_shrinkage=False
+        )
+        self.assertEqual(shrunk_stat.shape, (N, N))
+        evals_stat = np.linalg.eigvalsh(shrunk_stat)
+        self.assertTrue((evals_stat > 0).all())
+
 
 if __name__ == "__main__":
     unittest.main()

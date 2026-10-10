@@ -127,7 +127,67 @@ class TestOrderLifecycleFSM(unittest.TestCase):
             self.assertTrue(success)
             self.assertEqual(client.fsm.get_state("ord_404_test"), OrderState.FILLED)
 
+    def test_process_sse_event_monotonic_ulid_order(self):
+        cid = "bot_sse_001"
+        ulid_1 = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+        ulid_2 = "01ARZ3NDEKTSV4RRFFQ69G5FAW"
+        ulid_3 = "01ARZ3NDEKTSV4RRFFQ69G5FAX"
+
+        # 1. New order arrival via SSE
+        self.assertTrue(self.fsm.process_sse_event(cid, OrderState.NEW, event_id=ulid_1))
+        self.assertEqual(self.fsm.get_state(cid), OrderState.NEW)
+
+        # 2. Partially filled with newer ULID
+        self.assertTrue(self.fsm.process_sse_event(cid, OrderState.PARTIALLY_FILLED, event_id=ulid_2, filled_qty=20))
+        self.assertEqual(self.fsm.get_state(cid), OrderState.PARTIALLY_FILLED)
+
+        # 3. Final fill with newer ULID
+        self.assertTrue(self.fsm.process_sse_event(cid, OrderState.FILLED, event_id=ulid_3, filled_qty=100))
+        self.assertEqual(self.fsm.get_state(cid), OrderState.FILLED)
+
+    def test_process_sse_event_rejects_stale_out_of_order_ulid(self):
+        cid = "bot_sse_stale"
+        ulid_older = "01ARZ3NDEKTSV4RRFFQ69G5FA1"
+        ulid_newer = "01ARZ3NDEKTSV4RRFFQ69G5FA9"
+
+        # Initialize with newer event
+        self.assertTrue(self.fsm.process_sse_event(cid, OrderState.NEW, event_id=ulid_newer))
+
+        # Stale message with older ULID from backend thread pool must be rejected
+        self.assertFalse(self.fsm.process_sse_event(cid, OrderState.PARTIALLY_FILLED, event_id=ulid_older))
+        self.assertEqual(self.fsm.get_state(cid), OrderState.NEW)
+
+    def test_process_sse_event_terminal_immutability_against_delayed_sse(self):
+        cid = "bot_sse_term"
+        ulid_1 = "01ARZ3NDEKTSV4RRFFQ69G5FB1"
+        ulid_2 = "01ARZ3NDEKTSV4RRFFQ69G5FB2"
+        ulid_3 = "01ARZ3NDEKTSV4RRFFQ69G5FB3"
+
+        # Transition to FILLED
+        self.assertTrue(self.fsm.process_sse_event(cid, OrderState.NEW, event_id=ulid_1))
+        self.assertTrue(self.fsm.process_sse_event(cid, OrderState.FILLED, event_id=ulid_2))
+        self.assertTrue(self.fsm.is_terminal(cid))
+
+        # Delayed PARTIALLY_FILLED event arriving after FILLED must be rejected, even with later timestamp
+        self.assertFalse(self.fsm.process_sse_event(cid, OrderState.PARTIALLY_FILLED, event_id=ulid_3))
+        self.assertEqual(self.fsm.get_state(cid), OrderState.FILLED)
+
+    def test_alpaca_handle_sse_event_integration(self):
+        cfg = load_config()
+        client = AlpacaPaperClient(cfg, dry_run=False)
+        event_payload = {
+            "id": "01ARZ3NDEKTSV4RRFFQ69G5FC1",
+            "client_order_id": "bot_alpaca_sse_test",
+            "event": "fill",
+            "qty": "50",
+            "order_id": "ord_alpaca_ex_001"
+        }
+        res = client.handle_sse_event(event_payload)
+        self.assertTrue(res)
+        self.assertEqual(client.fsm.get_state("bot_alpaca_sse_test"), OrderState.FILLED)
+
 
 if __name__ == "__main__":
     unittest.main()
+
 

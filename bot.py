@@ -78,6 +78,7 @@ class TradingBot:
         # Broker & Audit Ledger
         self.broker = AlpacaPaperClient(config, dry_run=dry_run)
         self.ledger = TradeLedger(db_path)
+        self.ledger.start_checkpoint_daemon(interval_sec=300.0)
 
         # Warm start neural network weights from offline pre-trained checkpoint
         weights_file = Path(__file__).resolve().parent / "model" / "weights" / "ensemble_pretrained.pt"
@@ -331,14 +332,7 @@ class TradingBot:
             metrics = self.trainer.train_step(self.buffer, batch_size=self.config.model.batch_size)
             print(f"[Self-Learning] Online training step {metrics.total_steps} completed | Bull Loss: {metrics.bull_loss:.4f} | Bear Loss: {metrics.bear_loss:.4f}")
 
-        # 8. Maintenance: Proactively checkpoint SQLite WAL log to prevent checkpoint starvation
-        try:
-            busy, log_frames, checkpointed = self.ledger.checkpoint_wal(mode="PASSIVE")
-            if log_frames > 0:
-                print(f"[Persistence] SQLite WAL checkpointed {checkpointed}/{log_frames} frames to disk.")
-        except Exception:
-            pass
-
+        # 8. Maintenance: Managed asynchronously by background WAL checkpoint daemon (RESTART mode)
         elapsed = time.time() - start_time
         print(f"[Cycle Finished] Completed in {elapsed:.2f}s | Orders Authorized: {authorized_count} | Executed: {executed_count}")
         print("=" * 65 + "\n")
@@ -352,3 +346,9 @@ class TradingBot:
             circuit_breaker_status=breaker_state.status.value,
             total_equity=account.equity
         )
+
+    def close(self) -> None:
+        """Gracefully terminates background worker threads and closes ledger connections."""
+        if hasattr(self, "ledger") and self.ledger is not None:
+            self.ledger.stop_checkpoint_daemon()
+            self.ledger.close()

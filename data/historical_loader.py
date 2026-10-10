@@ -49,8 +49,54 @@ class HistoricalDataLoader:
         "AMZN": "1997-05-15",
         "GOOGL": "2004-08-19",
         "META": "2012-05-18",
-        "AMD": "1972-09-27"
+        "AMD": "1972-09-27",
+        "TWTR": "2013-11-07",
+        "BBBY": "1992-06-04",
+        "LEHM": "1994-05-31",
+        "ENRN": "1985-07-01",
     }
+
+    # Point-in-Time constituent delisting/termination dates (None indicates currently active)
+    CONSTITUENT_DELISTING = {
+        "SPY": None,
+        "QQQ": None,
+        "AAPL": None,
+        "NVDA": None,
+        "MSFT": None,
+        "TSLA": None,
+        "AMZN": None,
+        "GOOGL": None,
+        "META": None,
+        "AMD": None,
+        "TWTR": "2022-10-27",  # Taken private
+        "BBBY": "2023-05-03",  # Chapter 11 delisting
+        "LEHM": "2008-09-15",  # Bankruptcy filing
+        "ENRN": "2001-12-02",  # Bankruptcy filing
+    }
+
+    @classmethod
+    def is_constituent_tradable(cls, ticker: str, as_of_date: str) -> bool:
+        """Evaluates boolean universe membership window: as_of_date in [inception, delisting).
+        
+        Eliminates Class I survivorship contamination by ensuring delisted or un-incepted
+        assets cannot generate signals or execute trades outside their valid active window.
+        """
+        date_str = str(as_of_date)[:10]
+        inception = cls.CONSTITUENT_INCEPTION.get(ticker)
+        if inception and date_str < inception:
+            return False
+
+        delisting = cls.CONSTITUENT_DELISTING.get(ticker)
+        if delisting and date_str >= delisting:
+            return False
+
+        return True
+
+    @classmethod
+    def filter_active_universe(cls, tickers: list[str], as_of_date: str) -> list[str]:
+        """Filters an investable universe of tickers down to those active as of as_of_date."""
+        return [t for t in tickers if cls.is_constituent_tradable(t, as_of_date)]
+
 
     def __init__(self, cache_dir: str | Path | None = None, seed: int = 42):
         if cache_dir is None:

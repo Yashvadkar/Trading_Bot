@@ -348,3 +348,30 @@ class AlpacaPaperClient:
             filled_price=0.0,
             message="Action is HOLD; no order placed."
         )
+
+    def handle_sse_event(self, event_data: dict) -> bool:
+        """Dispatches an Alpaca Activity SSE or Trade Update event into the sequence-gated FSM."""
+        event_id = str(event_data.get("id") or event_data.get("event_id") or "")
+        client_order_id = str(event_data.get("client_order_id") or "")
+        event_type = str(event_data.get("event") or event_data.get("activity_type") or "").lower()
+
+        state_map = {
+            "new": OrderState.NEW,
+            "fill": OrderState.FILLED,
+            "partial_fill": OrderState.PARTIALLY_FILLED,
+            "canceled": OrderState.CANCELED,
+            "rejected": OrderState.REJECTED,
+            "expired": OrderState.CANCELED,
+        }
+        target_state = state_map.get(event_type, OrderState.NEW)
+        filled_qty = int(event_data.get("qty") or event_data.get("cum_qty") or 0)
+        exchange_order_id = event_data.get("order_id")
+
+        return self.fsm.process_sse_event(
+            client_order_id=client_order_id,
+            new_state=target_state,
+            event_id=event_id,
+            filled_qty=filled_qty,
+            exchange_order_id=exchange_order_id
+        )
+

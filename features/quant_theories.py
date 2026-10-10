@@ -66,7 +66,8 @@ class QuantTheoryEngine:
     def clean_correlation_rmt(
         returns: np.ndarray,
         clip_floor: float = 1e-8,
-        shrinkage_weight: float = 0.05
+        shrinkage_weight: float = 0.05,
+        dynamic_shrinkage: bool = True
     ) -> tuple[np.ndarray, np.ndarray, float]:
         """Filters noise eigenvalues using the analytical Marčenko–Pastur law and Ledoit-Wolf shrinkage.
         
@@ -74,13 +75,14 @@ class QuantTheoryEngine:
             q = T / N
             lambda_+ = sigma^2 * (1 + sqrt(1 / q))^2
         Under scoped np.errstate, clips eigenvalues to floor, shrinks noise eigenvalues to their mean,
-        reconstructs cleaned correlation matrix, and applies Ledoit-Wolf structural shrinkage:
+        reconstructs cleaned correlation matrix, and applies dynamic or static Ledoit-Wolf structural shrinkage:
             C_shrunk = (1 - alpha) * C_clean + alpha * I
         
         Args:
             returns: Array of shape (T, N) where T >= N
             clip_floor: Minimum eigenvalue threshold
-            shrinkage_weight: Ledoit-Wolf shrinkage coefficient alpha (default: 0.05)
+            shrinkage_weight: Fallback Ledoit-Wolf shrinkage coefficient alpha (default: 0.05)
+            dynamic_shrinkage: If True, computes analytical dynamic Ledoit-Wolf shrinkage intensity
             
         Returns:
             (shrunk_corr, top_eigenvalues, noise_ratio)
@@ -120,9 +122,28 @@ class QuantTheoryEngine:
             cleaned_corr = np.divide(cleaned_corr, d_outer, out=np.zeros_like(cleaned_corr), where=(d_outer > 0))
             np.fill_diagonal(cleaned_corr, 1.0)
 
+            # Dynamic Ledoit-Wolf optimal shrinkage intensity toward Identity
+            alpha = float(shrinkage_weight)
+            if dynamic_shrinkage and t_obs >= 10 and n_assets >= 2:
+                try:
+                    std = np.std(returns, axis=0, ddof=0)
+                    std[std < 1e-8] = 1.0
+                    y = (returns - np.mean(returns, axis=0)) / std
+                    z = y ** 2
+                    # Asymptotic variance of sample correlations: Var(r_ij) = (1/T) sum (y_ti y_tj - r_ij)^2
+                    # Vectorized: (1/T) * (Z^T Z) - corr^2
+                    v = (z.T @ z) / float(t_obs) - (corr ** 2)
+                    pi_hat = float(np.sum(np.maximum(v, 0.0)))
+                    gamma_hat = float(np.sum(corr ** 2) - float(n_assets))
+                    if gamma_hat > 1e-8:
+                        alpha_opt = (pi_hat / gamma_hat) / float(t_obs)
+                        alpha = float(np.clip(alpha_opt, 0.01, 0.40))
+                except Exception:
+                    alpha = float(shrinkage_weight)
+
             # Post-clipping Ledoit-Wolf structured shrinkage toward Identity
             # Guarantees strict positive definiteness and bounds condition number
-            shrunk_corr = (1.0 - shrinkage_weight) * cleaned_corr + shrinkage_weight * np.eye(n_assets)
+            shrunk_corr = (1.0 - alpha) * cleaned_corr + alpha * np.eye(n_assets)
             np.fill_diagonal(shrunk_corr, 1.0)
 
         noise_ratio = float(np.sum(is_noise)) / float(n_assets)
@@ -137,10 +158,16 @@ class QuantTheoryEngine:
         cls,
         returns: np.ndarray,
         clip_floor: float = 1e-8,
-        shrinkage_weight: float = 0.05
+        shrinkage_weight: float = 0.05,
+        dynamic_shrinkage: bool = True
     ) -> tuple[np.ndarray, np.ndarray, float]:
         """Backward-compatible entry point delegating to clean_correlation_rmt."""
-        return cls.clean_correlation_rmt(returns, clip_floor=clip_floor, shrinkage_weight=shrinkage_weight)
+        return cls.clean_correlation_rmt(
+            returns,
+            clip_floor=clip_floor,
+            shrinkage_weight=shrinkage_weight,
+            dynamic_shrinkage=dynamic_shrinkage
+        )
 
     # =========================================================================
     # 2. Path Signatures (Rough Path Theory) — Iterated Integrals & Lévy Area

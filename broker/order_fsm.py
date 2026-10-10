@@ -33,6 +33,8 @@ class OrderStateRecord:
     last_updated: float
     filled_qty: int = 0
     in_flight_modification: bool = False
+    last_event_id: str | None = None
+
 
 
 class OrderLifecycleFSM:
@@ -194,4 +196,58 @@ class OrderLifecycleFSM:
         record.in_flight_modification = False
         record.last_updated = now
         return True
+
+    def process_sse_event(
+        self,
+        client_order_id: str,
+        new_state: OrderState,
+        event_id: str,
+        filled_qty: int = 0,
+        exchange_order_id: str | None = None
+    ) -> bool:
+        """Processes Alpaca Activity SSE events using ULID lexicographical sorting 
+        to guarantee state machine determinism and Last-Write-Wins (CRDT) consistency.
+        
+        Returns True if transition applied, False if rejected as stale or terminal reversion.
+        """
+        now = time.time()
+        record = self._orders.get(client_order_id)
+        if not record and exchange_order_id:
+            c_id = self._exchange_to_client.get(exchange_order_id)
+            if c_id:
+                record = self._orders.get(c_id)
+
+        # 1. New order ingestion
+        if not record:
+            new_rec = self.register_order(client_order_id, exchange_order_id=exchange_order_id, initial_state=new_state)
+            new_rec.last_event_id = event_id
+            if filled_qty > 0:
+                new_rec.filled_qty = filled_qty
+            return True
+
+        # 2. Sequence Gate: Reject stale, out-of-order messages from the thread pool.
+        # ULIDs are lexicographically sortable by high-precision timestamp.
+        if record.last_event_id and event_id <= record.last_event_id:
+            return False  # Discard out-of-order event
+
+        # 3. Immutability Guard: Terminal states can never be reverted
+        if record.state.is_terminal:
+            return False  # Order is already finalized, discard delayed transition
+
+        # 4. Valid Transition Check
+        allowed = self.VALID_TRANSITIONS.get(record.state, set())
+        if new_state not in allowed and new_state != record.state:
+            return False
+
+        # 5. Monotonic Update
+        record.state = new_state
+        record.last_event_id = event_id
+        record.last_updated = now
+        if filled_qty > 0:
+            record.filled_qty = filled_qty
+        if new_state.is_terminal:
+            record.in_flight_modification = False
+
+        return True
+
 

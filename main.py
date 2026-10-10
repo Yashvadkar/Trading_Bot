@@ -160,16 +160,18 @@ def main() -> None:
     print(config.summary())
 
     bot = TradingBot(config=config, dry_run=is_dry_run)
-
-    if args.daemon or args.continuous:
-        run_daemon_loop(bot, config, args.interval)
-    else:
-        for i in range(args.cycles):
-            print(f"\n>>> Running Autonomous Cycle {i + 1} of {args.cycles} <<<")
-            bot.run_cycle()
-            if i < args.cycles - 1:
-                print(f"Sleeping {args.interval}s until next cycle...")
-                time.sleep(args.interval)
+    try:
+        if args.daemon or args.continuous:
+            run_daemon_loop(bot, config, args.interval)
+        else:
+            for i in range(args.cycles):
+                print(f"\n>>> Running Autonomous Cycle {i + 1} of {args.cycles} <<<")
+                bot.run_cycle()
+                if i < args.cycles - 1:
+                    print(f"Sleeping {args.interval}s until next cycle...")
+                    time.sleep(args.interval)
+    finally:
+        bot.close()
 
 
 if __name__ == "__main__":

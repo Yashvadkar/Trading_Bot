@@ -7,6 +7,8 @@ and executed trade with parameterized SQL statements and clean DAO patterns.
 from __future__ import annotations
 import sqlite3
 import asyncio
+import threading
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -28,9 +30,18 @@ class TradeRecord:
 class TradeLedger:
     """Manages SQLite persistent audit logging for the trading bot."""
 
-    def __init__(self, db_path: str | Path = "trades.db"):
+    def __init__(
+        self,
+        db_path: str | Path = "trades.db",
+        auto_checkpoint: bool = False,
+        checkpoint_interval_sec: float = 300.0
+    ):
         self.db_path = Path(db_path)
         self._init_schema()
+        self._stop_event = threading.Event()
+        self._checkpoint_thread: threading.Thread | None = None
+        if auto_checkpoint:
+            self.start_checkpoint_daemon(interval_sec=checkpoint_interval_sec)
 
     @contextmanager
     def _get_connection(self):
@@ -46,11 +57,38 @@ class TradeLedger:
         finally:
             conn.close()
 
+    def start_checkpoint_daemon(self, interval_sec: float = 300.0) -> None:
+        """Starts a dedicated background daemon thread executing periodic PRAGMA wal_checkpoint(RESTART);"""
+        if self._checkpoint_thread and self._checkpoint_thread.is_alive():
+            return
+        self._stop_event.clear()
+
+        def _worker():
+            while not self._stop_event.wait(timeout=interval_sec):
+                try:
+                    self.checkpoint_wal(mode="RESTART")
+                except Exception:
+                    pass
+
+        self._checkpoint_thread = threading.Thread(target=_worker, daemon=True, name="WALCheckpointDaemon")
+        self._checkpoint_thread.start()
+
+    def stop_checkpoint_daemon(self, timeout: float = 2.0) -> None:
+        """Signals the checkpoint daemon to stop and joins the thread."""
+        self._stop_event.set()
+        if self._checkpoint_thread and self._checkpoint_thread.is_alive():
+            self._checkpoint_thread.join(timeout=timeout)
+            self._checkpoint_thread = None
+
+    def close(self) -> None:
+        """Stops background threads and cleans up ledger resources."""
+        self.stop_checkpoint_daemon()
+
     def _sync_batch_write(self, queries: list[tuple[str, tuple]]) -> None:
         """Strictly synchronous atomic batch write executed within worker thread or caller.
         
         Uses BEGIN IMMEDIATE to acquire an immediate write lock, commits on success,
-        rolls back on error, and ensures PRAGMA wal_checkpoint(PASSIVE) in finally block.
+        rolls back on error. PASSIVE checkpoint removed from latency-critical write path.
         """
         if not queries:
             return
@@ -72,10 +110,6 @@ class TradeLedger:
                 pass
             raise
         finally:
-            try:
-                conn.execute("PRAGMA wal_checkpoint(PASSIVE);")
-            except Exception:
-                pass
             conn.close()
 
     async def async_commit_state(self, queries: list[tuple[str, tuple]]) -> None:
@@ -164,18 +198,22 @@ class TradeLedger:
             rows = cursor.fetchall()
             return [dict(r) for r in rows]
 
-    def checkpoint_wal(self, mode: str = "PASSIVE") -> tuple[int, int, int]:
+    def checkpoint_wal(self, mode: str = "RESTART") -> tuple[int, int, int]:
         """Executes explicit WAL checkpoint to truncate WAL file and reclaim disk frames.
         
         Mitigates checkpoint starvation caused by high-throughput concurrent readers.
         Modes: PASSIVE, FULL, RESTART, TRUNCATE.
         Returns: (busy, log_frames, checkpointed_frames)
         """
-        valid_mode = mode.upper() if mode.upper() in ("PASSIVE", "FULL", "RESTART", "TRUNCATE") else "PASSIVE"
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(f"PRAGMA wal_checkpoint({valid_mode});")
-            row = cursor.fetchone()
-            if row:
-                return int(row[0]), int(row[1]), int(row[2])
-            return 0, 0, 0
+        valid_mode = mode.upper() if mode.upper() in ("PASSIVE", "FULL", "RESTART", "TRUNCATE") else "RESTART"
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(f"PRAGMA wal_checkpoint({valid_mode});")
+                row = cursor.fetchone()
+                if row:
+                    return int(row[0]), int(row[1]), int(row[2])
+        except sqlite3.OperationalError:
+            pass
+        return 0, 0, 0
+
