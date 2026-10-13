@@ -25,7 +25,11 @@ from model.replay_buffer import ReplayBuffer
 from model.trainer import EnsembleTrainer
 from model.pretrain import run_pretraining
 from risk.circuit_breaker import CircuitBreaker, BreakerStatus
-from risk.governor import RiskGovernor, OrderDirective, OrderSide, PositionDirective, PositionActionType
+from risk.governor import (
+    RiskGovernor, OrderDirective, OrderSide, PositionDirective, PositionActionType,
+    CandidateIntent, BatchAllocationResult
+)
+from model.kronos_adapter import KronosAdapter
 from broker.alpaca_client import AlpacaPaperClient, AccountStatus, PositionInfo
 from broker.ledger import TradeLedger, TradeRecord
 
@@ -52,6 +56,7 @@ class TradingBot:
         self.scout = DiscoveryScout()
         self.screener = QuantitativeScreener(config.risk)
         self.normalizer = StateNormalizer()
+        self.kronos = KronosAdapter()
 
         # Neural Debate Ensemble
         self.bull_net = BullNetwork(state_dim=config.model.state_dim, hidden_dim=config.model.hidden_dim)
@@ -187,6 +192,8 @@ class TradingBot:
                         ))
                         if exit_res.success:
                             print(f"[Broker: EXIT SUCCESS] Closed position in {pos.ticker}")
+                            r_mult = float(pos.unrealized_pnl_pct / (2.0 * stock_data.technicals.atr / pos.current_price)) if stock_data.technicals.atr > 0 and pos.current_price > 0 else 0.0
+                            self.governor.record_trade_outcome(pnl=pos.unrealized_pnl, r_multiple=r_mult)
                     elif pos_directive.action_type == PositionActionType.UPDATE_STOP:
                         print(f"[Position Monitor: RATCHET STOP] {pos.ticker} - {pos_directive.reason}")
                         updated = self.broker.update_stop_loss(pos.ticker, pos_directive.new_stop_price)
@@ -212,7 +219,11 @@ class TradingBot:
         authorized_count = 0
         executed_count = 0
 
-        # 4. Neural Debate & Risk Execution for each approved stock
+        # 4. Stage 1: Neural Debate Arena across all screened stocks
+        candidate_intents: list[CandidateIntent] = []
+        debate_verdicts: dict[str, DebateVerdict] = {}
+        state_map: dict[str, torch.Tensor] = {}
+
         for stock in screened_stocks:
             mention = next((m for m in discovered if m.ticker == stock.ticker), None)
             sent_score = mention.sentiment_score if mention else 0.0
@@ -232,7 +243,7 @@ class TradingBot:
                 daily_drawdown_pct=breaker_state.daily_drawdown_pct
             )
 
-            # Build initial state with neutral debate prior
+            # Build state vector with technicals, sentiment, fundamentals, microstructure
             state_tensor = self.normalizer.build_state_vector(
                 stock.technicals,
                 sent_metrics,
@@ -241,9 +252,11 @@ class TradingBot:
                 port_context,
                 DebateMetrics()
             )
+            state_map[stock.ticker] = state_tensor
 
-            # Run Debate between Bull and Bear
+            # Run adversarial debate between Bull and Bear
             verdict: DebateVerdict = self.arena.evaluate_debate(state_tensor)
+            debate_verdicts[stock.ticker] = verdict
             self.ledger.log_debate(
                 ticker=stock.ticker,
                 bull_conf=verdict.bull_probs[1] + verdict.bull_probs[2],
@@ -261,71 +274,107 @@ class TradingBot:
                 f"Consensus: {'APPROVED' if verdict.is_consensus_approved else 'REJECTED (High Uncertainty)'}"
             )
 
-            # 5. Risk Governor Evaluation (with Conformal Kelly and CVD Urgency)
-            cvd_div = getattr(stock.microstructure, "cvd_divergence", 0.0) if hasattr(stock, "microstructure") else 0.0
-            directive: OrderDirective = self.governor.evaluate_order(
-                ticker=stock.ticker,
-                action=verdict.chosen_action,
-                current_price=stock.price,
-                atr=stock.technicals.atr,
-                portfolio_equity=account.equity,
-                available_cash=account.cash,
-                current_positions_count=len(positions),
-                is_already_held=(stock.ticker in held_tickers),
-                circuit_breaker_active=(breaker_state.status != BreakerStatus.NORMAL),
-                cvd_divergence=cvd_div
-            )
+            # Only candidates with non-HOLD action and consensus approval proceed to allocator
+            if verdict.is_consensus_approved and verdict.chosen_action in (1, 2, 3):
+                cvd_div = getattr(stock.microstructure, "cvd_divergence", 0.0) if hasattr(stock, "microstructure") else 0.0
+                evt_tail = getattr(stock.microstructure, "evt_var_99", 0.0) if hasattr(stock, "microstructure") else 0.0
+                stop_dist = max(stock.technicals.atr * self.config.risk.atr_multiplier_stop, stock.price * 0.01)
+                if evt_tail > 0.0:
+                    stop_dist = max(stop_dist, stock.price * evt_tail)
 
-            if directive.is_authorized:
-                authorized_count += 1
-                if len(directive.child_slices) > 1:
-                    child_routes = self.governor.slicer.route_child_slices(
-                        total_shares=directive.shares,
-                        price=directive.limit_price,
-                        adv=10_000_000.0,
-                        cvd_divergence=cvd_div,
-                        side=directive.side
-                    )
-                    route_summary = [f"{c.shares}sh ({c.routing_type.value}, P_fill={c.fill_prob:.2f})" for c in child_routes]
-                    print(f"[Almgren-Chriss] Sliced parent order into {len(child_routes)} dynamic blocks: {route_summary}")
-
-                print(
-                    f"[Risk Governor: APPROVED] {directive.side.value.upper()} {directive.shares} shares of {directive.ticker} "
-                    f"at ~${directive.limit_price:.2f} (Stop Loss: ${directive.stop_loss_price:.2f}, Capital: ${directive.dollar_allocation:,.2f})"
+                # Query Kronos foundation adapter for forward trajectory context
+                self.kronos.predict_forward_trajectory(
+                    ticker=stock.ticker,
+                    closes=[stock.price * (1.0 + x * 0.002) for x in range(-10, 1)]
                 )
 
-                # 6. Broker Execution
-                res = self.broker.submit_order(directive)
-                if res.success:
-                    executed_count += 1
-                    self.governor.otr_tracker.record_trade()
-                    print(f"[Broker: SUCCESS] {res.message} (Order ID: {res.order_id})")
-                    self.ledger.log_trade(TradeRecord(
-                        ticker=directive.ticker,
-                        side=directive.side.value,
-                        shares=directive.shares,
-                        price=directive.limit_price,
-                        stop_loss=directive.stop_loss_price,
-                        order_id=res.order_id or "UNKNOWN",
-                        status="SUBMITTED",
-                        realized_pnl=0.0
-                    ))
-                else:
-                    print(f"[Broker: REJECTED] {res.message}")
-            else:
-                if verdict.chosen_action != 0:
-                    print(f"[Risk Governor: BLOCKED] {stock.ticker} - {directive.rejection_reason}")
+                candidate_intents.append(CandidateIntent(
+                    ticker=stock.ticker,
+                    price=stock.price,
+                    atr=stock.technicals.atr,
+                    stop_dist=stop_dist,
+                    action=verdict.chosen_action,
+                    debate_confidence=verdict.action_confidence,
+                    sortino_ratio=getattr(stock.fundamentals, "sortino_ratio", 1.5) if hasattr(stock, "fundamentals") else 1.5,
+                    cvd_divergence=cvd_div,
+                    evt_var_99=evt_tail
+                ))
 
-            # Store transition in replay buffer for continuous self-learning
-            reward_estimate = float(stock.technicals.macd_hist * 0.01)
-            self.buffer.push(
-                state=state_tensor,
-                action=verdict.chosen_action,
-                reward=reward_estimate,
-                next_state=state_tensor,
-                done=False,
-                disagreement_var=verdict.disagreement_variance
+        # 5. Stage 2: Multi-Asset Covariance Kelly & Capital Conservation Batch Allocation
+        print(f"[Allocator] Submitting {len(candidate_intents)} debated candidates to Portfolio Capital Allocator...")
+        batch_result: BatchAllocationResult = self.governor.evaluate_batch(
+            candidates=candidate_intents,
+            portfolio_equity=account.equity,
+            available_cash=account.cash,
+            current_positions_count=len(positions),
+            held_tickers=held_tickers,
+            circuit_breaker_active=(breaker_state.status != BreakerStatus.NORMAL),
+            market_uptrend=True
+        )
+
+        print(
+            f"[Allocator Result] Selected: {batch_result.selected_tickers} | "
+            f"Authorized: {len(batch_result.authorized_directives)} | "
+            f"Allocated: ${batch_result.total_allocated_capital:,.2f} / Pool: ${batch_result.cash_pool:,.2f}"
+        )
+        if batch_result.weights:
+            print(f"[Allocator Weights] {batch_result.weights}")
+
+        for rej in batch_result.rejected_directives:
+            if rej.rejection_reason and "HOLD" not in rej.rejection_reason:
+                print(f"[Risk Governor: BLOCKED] {rej.ticker} - {rej.rejection_reason}")
+
+        # 6. Stage 3: Broker Execution of Authorized Directives
+        for directive in batch_result.authorized_directives:
+            authorized_count += 1
+            if len(directive.child_slices) > 1:
+                child_routes = self.governor.slicer.route_child_slices(
+                    total_shares=directive.shares,
+                    price=directive.limit_price,
+                    adv=self.config.risk.min_avg_daily_volume_usd,
+                    cvd_divergence=0.0,
+                    side=directive.side
+                )
+                route_summary = [f"{c.shares}sh ({c.routing_type.value}, P_fill={c.fill_prob:.2f})" for c in child_routes]
+                print(f"[Almgren-Chriss] Sliced parent order into {len(child_routes)} dynamic blocks: {route_summary}")
+
+            print(
+                f"[Risk Governor: APPROVED] {directive.side.value.upper()} {directive.shares} shares of {directive.ticker} "
+                f"at ~${directive.limit_price:.2f} (Stop Loss: ${directive.stop_loss_price:.2f}, Capital: ${directive.dollar_allocation:,.2f})"
             )
+
+            res = self.broker.submit_order(directive)
+            if res.success:
+                executed_count += 1
+                self.governor.otr_tracker.record_trade()
+                print(f"[Broker: SUCCESS] {res.message} (Order ID: {res.order_id})")
+                self.ledger.log_trade(TradeRecord(
+                    ticker=directive.ticker,
+                    side=directive.side.value,
+                    shares=directive.shares,
+                    price=directive.limit_price,
+                    stop_loss=directive.stop_loss_price,
+                    order_id=res.order_id or "UNKNOWN",
+                    status="SUBMITTED",
+                    realized_pnl=0.0
+                ))
+            else:
+                print(f"[Broker: REJECTED] {res.message}")
+
+        # Store transitions in replay buffer for continuous self-learning
+        for stock in screened_stocks:
+            if stock.ticker in debate_verdicts and stock.ticker in state_map:
+                v = debate_verdicts[stock.ticker]
+                st = state_map[stock.ticker]
+                reward_estimate = float(stock.technicals.macd_hist * 0.01)
+                self.buffer.push(
+                    state=st,
+                    action=v.chosen_action,
+                    reward=reward_estimate,
+                    next_state=st,
+                    done=False,
+                    disagreement_var=v.disagreement_variance
+                )
 
         # 7. Post-cycle online learning step
         if len(self.buffer) >= self.config.model.batch_size:

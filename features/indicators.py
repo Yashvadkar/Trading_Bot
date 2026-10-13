@@ -170,3 +170,81 @@ def extract_technicals(
         realized_volatility=realized_vol,
         volume_surge_ratio=vol_surge,
     )
+
+
+def compute_ema(series: np.ndarray, span: int) -> np.ndarray:
+    """Vectorized exponential moving average."""
+    series = np.asarray(series, dtype=np.float64)
+    if len(series) == 0:
+        return np.array([], dtype=np.float64)
+    alpha = 2.0 / (span + 1.0)
+    res = np.empty_like(series, dtype=np.float64)
+    res[0] = series[0]
+    for t in range(1, len(series)):
+        res[t] = alpha * series[t] + (1.0 - alpha) * res[t - 1]
+    return res
+
+
+def detect_volatility_contraction_pattern(
+    highs: np.ndarray,
+    lows: np.ndarray,
+    closes: np.ndarray,
+    volumes: np.ndarray,
+    lookback: int = 30
+) -> tuple[bool, float, dict]:
+    """Detects Minervini/Gajjala Intraday Volatility Contraction Pattern (VCP).
+    
+    Mathematical criteria:
+    1. Sequential swing depth contraction: D_1 > D_2 with final contraction depth <= 12%
+    2. Volume dry-up: final contraction volume < 0.70 * baseline SMA(V)
+    3. Moving Average Perfect Order: Close >= EMA(9) >= EMA(21)
+    
+    Returns:
+        (is_vcp, contraction_ratio, metrics_dict)
+    """
+    n = len(closes)
+    if n < 22:
+        return False, 1.0, {"reason": "Insufficient bars for VCP analysis"}
+
+    h_sub = highs[-lookback:] if n >= lookback else highs
+    l_sub = lows[-lookback:] if n >= lookback else lows
+    c_sub = closes[-lookback:] if n >= lookback else closes
+    v_sub = volumes[-lookback:] if n >= lookback else volumes
+    sub_len = len(c_sub)
+
+    # 1. Moving average trend alignment (Close >= EMA 9 >= EMA 21)
+    ema9 = compute_ema(closes, 9)
+    ema21 = compute_ema(closes, 21)
+    cur_price = float(closes[-1])
+    is_trend_aligned = bool(cur_price >= ema9[-1] and ema9[-1] >= ema21[-1])
+
+    # 2. Divide lookback into 2 sequential contraction waves
+    mid = sub_len // 2
+    h1 = float(np.max(h_sub[:mid]))
+    l1 = float(np.min(l_sub[:mid]))
+    d1 = (h1 - l1) / max(h1, 1e-4)
+
+    h2 = float(np.max(h_sub[mid:]))
+    l2 = float(np.min(l_sub[mid:]))
+    d2 = (h2 - l2) / max(h2, 1e-4)
+
+    is_contracting = bool(d1 > d2 and d2 <= 0.12)
+    contraction_ratio = float(d2 / max(d1, 1e-4))
+
+    # 3. Volume dry-up: final 5 bars volume vs baseline SMA volume
+    avg_vol_baseline = float(np.mean(volumes[-min(n, 50):]))
+    final_vol = float(np.mean(v_sub[-min(5, len(v_sub)):]))
+    vol_dry_ratio = float(final_vol / max(avg_vol_baseline, 1.0))
+    is_volume_dry = bool(vol_dry_ratio <= 0.75)
+
+    is_vcp = bool(is_trend_aligned and is_contracting and is_volume_dry)
+    metrics = {
+        "is_trend_aligned": is_trend_aligned,
+        "is_contracting": is_contracting,
+        "is_volume_dry": is_volume_dry,
+        "depth_wave1": d1,
+        "depth_wave2": d2,
+        "contraction_ratio": contraction_ratio,
+        "vol_dry_ratio": vol_dry_ratio
+    }
+    return is_vcp, contraction_ratio, metrics

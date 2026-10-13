@@ -284,6 +284,33 @@ class TestTradingBotPipeline(unittest.TestCase):
             out_p, out_v, _ = bull(torch.randn(1, 64))
             self.assertEqual(out_p.shape, (1, 4))
 
+    def test_two_stage_batch_pipeline_and_kronos(self):
+        from model.kronos_adapter import KronosAdapter
+        from risk.governor import CandidateIntent, BatchAllocationResult
+
+        kronos = KronosAdapter()
+        pred = kronos.predict_forward_trajectory("AAPL", [150.0, 151.0, 152.0, 153.0, 154.0, 155.0])
+        self.assertEqual(pred.ticker, "AAPL")
+        self.assertGreater(pred.expected_volatility, 0.0)
+        self.assertEqual(len(pred.embedding_vector), 64)
+
+        cfg = load_config()
+        gov = RiskGovernor(cfg.risk)
+        candidates = [
+            CandidateIntent(ticker="NVDA", price=120.0, atr=3.0, stop_dist=6.0, debate_confidence=0.9, sortino_ratio=2.5),
+            CandidateIntent(ticker="AAPL", price=150.0, atr=2.5, stop_dist=5.0, debate_confidence=0.85, sortino_ratio=2.0),
+            CandidateIntent(ticker="MSFT", price=300.0, atr=5.0, stop_dist=10.0, debate_confidence=0.8, sortino_ratio=1.8),
+        ]
+        result: BatchAllocationResult = gov.evaluate_batch(
+            candidates=candidates,
+            portfolio_equity=10_000.0,
+            available_cash=8_000.0,
+            current_positions_count=0
+        )
+        self.assertTrue(len(result.authorized_directives) > 0)
+        self.assertLessEqual(result.total_allocated_capital, 8000.0 * 0.95)
+        self.assertLessEqual(len(result.authorized_directives), 3)
+
 
 if __name__ == "__main__":
     unittest.main()

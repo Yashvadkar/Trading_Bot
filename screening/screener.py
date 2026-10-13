@@ -9,7 +9,7 @@ from dataclasses import dataclass
 import numpy as np
 import yfinance as yf
 from config import RiskConfig
-from features.indicators import extract_technicals, TechnicalMetrics
+from features.indicators import extract_technicals, TechnicalMetrics, detect_volatility_contraction_pattern
 from features.normalizer import FundamentalMetrics, MicrostructureMetrics
 
 
@@ -23,6 +23,8 @@ class ScreenedStock:
     fundamentals: FundamentalMetrics
     microstructure: MicrostructureMetrics
     is_liquid: bool
+    is_vcp: bool = False
+    vcp_ratio: float = 1.0
     rejection_reason: str | None = None
 
 
@@ -92,6 +94,8 @@ class QuantitativeScreener:
                 volume_surge_ratio=technicals.volume_surge_ratio,
             )
 
+            is_vcp, vcp_ratio, _ = detect_volatility_contraction_pattern(highs, lows, closes, volumes)
+
             return ScreenedStock(
                 ticker=ticker,
                 price=current_price,
@@ -101,6 +105,8 @@ class QuantitativeScreener:
                 fundamentals=fundamentals,
                 microstructure=microstructure,
                 is_liquid=(rejection is None),
+                is_vcp=is_vcp,
+                vcp_ratio=vcp_ratio,
                 rejection_reason=rejection,
             )
 
@@ -115,3 +121,7 @@ class QuantitativeScreener:
             if stock and stock.is_liquid:
                 approved.append(stock)
         return approved
+
+    def filter_vcp_candidates(self, stocks: list[ScreenedStock]) -> list[ScreenedStock]:
+        """Returns liquid stocks strictly satisfying Volatility Contraction Pattern (VCP)."""
+        return [s for s in stocks if s.is_liquid and s.is_vcp]

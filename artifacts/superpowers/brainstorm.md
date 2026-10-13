@@ -1,99 +1,87 @@
-# Superpowers Brainstorm — Institutional Re-Audit & Microstructural Hardening
+# Superpowers Brainstorm: Money-Aware Portfolio Capital Allocation & Championship Risk Integration
 
 ## Goal
-Remediate all systemic vulnerabilities, mathematical traps, and microstructural race conditions identified in the second deep-research architectural and quantitative audit of `Trading_Bot`:
-1. Prevent REST vs WebSocket order modification race conditions and out-of-order state transitions.
-2. Integrate regulatory proximity exemptions ($\pm 0.75\%$ LTP delta) and zero-copy deque memory structures into the Order-to-Trade Ratio (OTR) governor.
-3. Formulate Conformal Prediction interval volatility scaling with absolute cash preservation (preventing gross leverage normalization from erasing predictive uncertainty).
-4. Eliminate floating-point instability in Random Matrix Theory (RMT) eigenvalue clipping using scoped numerical context managers and Ledoit-Wolf shrinkage.
-5. Upgrade Almgren-Chriss implementation shortfall execution to discrete intervals with Cont-Larrard queue dynamics and Cumulative Volume Delta (CVD) absorption urgency modulation.
-6. Enforce zero-await transaction boundaries, eager cursor draining, and proactive WAL checkpointing in the SQLite persistence layer.
-7. Implement formal Point-in-Time (PIT) natural filtration ($I_t \subset \mathcal{F}_t$) verification in the historical data pipeline to eliminate look-ahead and survivorship bias.
+Transform `Trading_Bot` from an isolated, single-order sizer into a **globally money-aware, small-account viable portfolio trading engine**. Integrate:
+1. **Simultaneous Multi-Asset Portfolio Kelly Allocation & Cycle Cash Budgeting**: Ensure multiple opportunities in a single cycle divide available cash strictly without exceeding buying power or starving smaller accounts.
+2. **Goverdhan "Gon" Gajjala (2023 US Investing Champion, +805% Return) Risk Architecture**:
+   - Asymmetric risk/reward modeling (targeting 2.5:1 to 3.5:1 payoff with 0.25%–0.50% account risk per trade).
+   - Minervini/Gajjala Progressive Exposure engine (expanding position limits and risk during win streaks; drastically throttling to cash during drawdowns).
+   - Intraday Volatility Contraction Pattern (VCP) and 9/21 EMA trend anchor screening.
+   - Partial scaling (selling 50% at 2R–3R, moving stop to breakeven, trailing runners on 9 EMA).
+3. **Small-Account Real-Money Adaptability**: Support fractional share execution via Alpaca `notional` or fractional quantities, preventing share rounding to 0 for accounts with $500–$5,000 capital.
 
 ---
 
 ## Constraints
-- **Platform**: Windows 11 host with Python 3.12, PyTorch, NumPy, Polars, yfinance, and SQLite.
-- **Execution Performance**: Sub-millisecond latency path for risk checks and state transitions; zero global monkey-patching of `np.seterr`.
-- **API Continuity**: 100% backward and forward compatibility with Alpaca Paper Trading REST and WebSocket endpoints.
-- **Architectural Simplicity**: Strictly follow the Ponytail anti-overengineering standard (native standard library, clean state machines, focused modules) rather than heavy external distributed frameworks.
-- **Zero In-Flight Breaking Changes**: Maintain 100% test pass rate across existing 30 unit tests.
+1. **Capital Conservation (No Buying Power Overdraw)**: Total authorized capital in any scanning cycle must strictly satisfy $\sum_{i} \text{Capital}_i \le \text{Available Cash} \times 0.95$.
+2. **Deterministic Risk Budgeting**: Individual trade risk must never exceed the active risk-per-trade budget ($0.25\%$ to $1.5\%$ of total equity), calculated strictly as $\text{Shares} \times (\text{Entry} - \text{Stop})$.
+3. **Broker Compatibility**: Maintain Alpaca Paper and Live REST/WebSocket execution idempotency while adding optional fractional share / notional execution for small accounts.
+4. **Execution Latency**: Portfolio optimization across candidates must be instantaneous ($<5\text{ms}$) using closed-form analytical equations (Vectorized Fractional Kelly / Water-Filling budgeter) rather than heavy quadratic programming solvers that stall the event loop.
+5. **No Regressions**: All 70 existing unit tests must continue passing without breaking.
 
 ---
 
 ## Known Context
-- **Current State**:
-  - `Trading_Bot` operates with 30 passing unit tests.
-  - REST client injects `client_order_id` with timeout recovery.
-  - `OTRTracker` enforces 35:1 throttle and 45:1 kill switch, but penalizes all orders without LTP proximity exemption.
-  - Sizing utilizes Fractional Kelly ($f^* = \kappa \frac{\hat{\mu}}{\hat{\sigma}^2}$), but uniform gross capping washes out conformal scale parameters.
-  - RMT Marčenko-Pastur filtering reconstructs correlation, but lacks scoped error contexts and eigenvalue floor clipping ($1e-8$).
-  - AC slicer partitions large orders, but assumes continuous linear schedule without discrete Cont-Larrard queue placement or CVD absorption feedback.
-  - SQLite uses WAL mode, but lacks explicit checkpoint triggers and eager cursor draining.
-  - Historical loader operates on fixed 10-symbol universe without explicit Point-in-Time availability validation.
+- **Current Architecture Flaw in `bot.py`**:
+  In `TradingBot.run_cycle()`, the loop over `screened_stocks` evaluates each stock against `account.cash` independently. If 8 stocks pass, each is evaluated as if 100% of cash is uncommitted, causing total authorized capital to exceed 139% of equity ($139k authorized on a $100k account).
+- **Disconnected Kelly Inputs**:
+  `risk/governor.py` possesses `calculate_fractional_kelly_capital()`, but `bot.py` never passes `returns_history` or `conformal_residuals` into `evaluate_order()`, causing the engine to fall back to a naive `min(0.20 * Equity, 0.95 * Cash)`.
+- **Championship Research (Gon Gajala, 805% Return, TraderLion Video `10pHBNVi4Jc`)**:
+  - Gajjala won the 2023 US Investing Championship stock division with an audited **+805% return** with only a **28%–31% win rate**.
+  - Key mathematics: Average win was 8.5%–13% vs average loss capped at 4% (asymmetry > 2.5R).
+  - Risk per trade was strictly capped at **0.25%–0.50%** of account equity.
+  - Employed Minervini's **Progressive Exposure**: Starting small; after 2–3 consecutive winners, increase exposure; after 2 consecutive losers, halve risk and contract back to base size.
+  - Core setups: Intraday Volatility Contraction Pattern (VCP) with volume drying up into tight consolidation pivots above 9 EMA & 21 EMA.
 
 ---
 
 ## Risks
-1. **Gross Leverage Conformal Washout**: If conformal intervals widen across all portfolio assets during market turbulence, naive gross leverage normalization scales weights back to 100% exposure, destroying conformal risk mitigation.
-2. **REST/WebSocket Race Condition**: Modifying a resting stop or limit price while the exchange matching engine fills the order can cause REST 404/422 responses; failing to recognize this as a fill leads to desynchronization.
-3. **Out-of-Order Message Jitter**: Multi-threaded WebSocket consumers processing `canceled` or `closed` before `filled` can cause state machine corruption.
-4. **SQLite Checkpoint Starvation**: Long-running read queries can prevent SQLite WAL file from truncating, ballooning disk I/O.
-5. **Numerical Divergence in Ill-Conditioned Regimes**: Near-singular correlation matrices with zero or negative eigenvalues can cause NaN propagation into portfolio optimization.
+1. **Small-Account Lumpy Sizing Without Fractional Shares**: On an account with $1,000, high-priced momentum stocks ($200–$1,000/share) cannot be purchased without fractional shares, or 1 share represents 50%+ of equity.
+   *Mitigation*: Implement Alpaca fractional share order routing (or notional dollar orders) when account equity $< \$10,000$ or share price exceeds 10% of equity.
+2. **Over-Diversification vs Under-Diversification**: Dividing a tiny account ($1,000) among 8 stocks leaves tiny $125 positions eaten up by bid-ask spread and slippage.
+   *Mitigation*: Implement an optimal candidate selector that picks the top $K$ ($K = \min(\text{max\_concurrent}, \lfloor \text{Equity} / 500 \rfloor)$) highest-conviction opportunities using Debate confidence $\times$ Kelly fraction score.
+3. **Premature Exposure Expansion in Volatile Regimes**: Expanding exposure too fast after temporary lucky wins could amplify subsequent drawdown.
+   *Mitigation*: Require both positive rolling trade expectancy ($\ge 1.5R$) and market regime filter (SPY/QQQ above 21 EMA) before increasing progressive exposure above base 0.5%.
 
 ---
 
 ## Options (2–4)
 
-### Option 1: Minimalist Error Handlers & Surface Parameter Tuning
-- Add `try/except` around REST `patch` calls, add a single `ltp` delta check in OTR, and keep the rest unchanged.
-- *Pros*: Quickest to implement.
-- *Cons*: Fails to address fundamental mathematical flaws (conformal gross cap dilution, RMT numerical instability, checkpoint starvation, look-ahead filtration).
+### Option A: Local Cycle Cash Tracker (Minimal Patch)
+- Simply decrement a mutable `cycle_available_cash` in `bot.py` as orders are authorized.
+- *Pros*: Very easy to implement.
+- *Cons*: First-come, first-served (FIFO) bias. The first ticker screened gets full capital; subsequent higher-conviction candidates get starved or rejected. Does not implement championship sizing or progressive exposure.
 
-### Option 2: Production-Grade Institutional Hardening (Recommended)
-- **State Engine**: Implement an `OrderLifecycleFSM` with valid immutable transition rules and Last-Write-Wins (LWW) monotonic sequence/timestamp gating. Handle 404/422 as terminal resting fills.
-- **OTR Governor**: Add SEBI/NSE $\pm 0.75\%$ LTP proximity exemption $\delta$ and `collections.deque` zero-copy rolling windows.
-- **Conformal Kelly**: Calculate $\hat{\sigma}_{i,t} = q_{i,t}^{eff} / z_{1-\alpha/2}$ and enforce **absolute cash preservation**, allowing total portfolio gross exposure to shrink toward cash when aggregate uncertainty expands.
-- **RMT Sanitization**: Add `np.clip(eigenvalues, a_min=1e-8, None)`, scoped `with np.errstate(...)`, and post-clip Ledoit-Wolf shrinkage.
-- **Discrete AC Execution**: Incorporate discrete child order intervals, Cont-Larrard limit/market order toggling, and CVD absorption divergence urgency modulation.
-- **Persistence Resiliency**: Enforce zero-await transaction boundaries, eager cursor consumption, and periodic `PRAGMA wal_checkpoint(PASSIVE)`.
-- **PIT Filtration**: Implement formal causal assertions ($I_t \subset \mathcal{F}_t$) in `HistoricalDataLoader`.
-- *Pros*: Completely resolves all 7 deep-research audit findings with mathematically sound, production-safe engineering.
-- *Cons*: Requires disciplined implementation across 6 modules with dedicated unit tests.
+### Option B: Two-Stage Simultaneous Portfolio Kelly & Progressive Exposure Engine (Recommended)
+- **Stage 1 (Batch Evaluation & Ranking)**: In each cycle, evaluate all approved debate candidates simultaneously. Compute each candidate's Conformal Fractional Kelly fraction $f_i^*$.
+- **Stage 2 (Global Budget Allocation & Water-Filling)**:
+  - Apply Gon Gajala's **Progressive Exposure Multiplier** $\mathcal{M}_{\text{prog}} \in [0.5, 2.0]$ based on rolling PnL streak and market trend.
+  - Budget available cash across top $K$ candidates proportional to their normalized Kelly conviction:
+    $$w_i = \frac{f_i^*}{\sum_{j=1}^K f_j^*}, \quad \text{Capital}_i = \min(w_i \cdot \text{Cash}_{\text{avail}}, \text{MaxCap}_i)$$
+  - Size shares using strict $R$-budget: $\text{Shares}_i = \min\left(\lfloor \frac{\text{Capital}_i}{P_i} \rfloor, \lfloor \frac{\text{Equity} \cdot R_i}{\text{StopDist}_i} \rfloor\right)$.
+  - Enable fractional shares if configured or if account equity $< \$10,000$.
+- *Pros*: Mathematically sound, money-aware, prevents overdraw, scales from $500 to $1,000,000 accounts, implements championship asymmetric risk.
+- *Cons*: Requires coordinating batch allocation in `RiskGovernor` before firing execution directives.
 
-### Option 3: Distributed Microservices Architecture (Over-Engineered)
-- Decouple execution into standalone microservices using Redis Streams, gRPC, and an external PostgreSQL database.
-- *Pros*: Theoretical horizontal scalability.
-- *Cons*: Violates the Ponytail standard; creates massive deployment overhead and unnecessary operational complexity for a single-daemon trading system.
+### Option C: Continuous Mean-Variance Quadratic Optimizer (Markowitz MVO)
+- Solve full numerical quadratic programming (SLSQP / CVXPY) across portfolio covariance matrix.
+- *Pros*: Theoretically optimal for static long-term portfolios.
+- *Cons*: Overkill for swing/momentum day trading, sensitive to covariance estimation noise, adds heavy external dependencies, violates Ponytail anti-overengineering standard.
 
 ---
 
 ## Recommendation
-Adopt **Option 2**. It directly attacks every single vulnerability highlighted by the audit without introducing unnecessary distributed architectural bloat. It adheres to Ponytail principles by leveraging Python's standard library (`collections.deque`, `dataclasses`, `enum`) and scoped NumPy/SQLite idioms.
+**Adopt Option B: Two-Stage Simultaneous Portfolio Kelly & Progressive Exposure Engine.**
+1. Implement `PortfolioCapitalAllocator` in `risk/governor.py` that takes all candidate directives in a cycle, computes global money budget, scales by Progressive Exposure, and allocates cash without FIFO bias.
+2. Feed historical return series and conformal residuals from `historical_loader.py` into the Kelly engine.
+3. Add Gajjala/Minervini Progressive Exposure tracking in `risk/governor.py` based on recent trade win/loss streaks recorded in `TradeLedger`.
+4. Add fractional share support in `broker/alpaca_client.py` for small-account capital efficiency.
 
 ---
 
 ## Acceptance Criteria
-1. **Order FSM & Race Condition**:
-   - `OrderLifecycleFSM` enforces monotonic transitions.
-   - REST 404/422 on order modification is reconciled as a terminal state (`FILLED` or `CANCELED`) without crashing.
-   - Out-of-order WebSocket messages are sequence-gated.
-2. **OTR Proximity Exemption**:
-   - Orders within $\pm 0.75\%$ of LTP are excluded from the OTR penalty numerator.
-   - `OTRTracker` uses sliding `deque` windows with zero-copy pruning.
-3. **Conformal Kelly & Cash Preservation**:
-   - Volatility dynamically derived from conformal interval width $\hat{\sigma}_{i,t} = q_{i,t}^{eff} / z_{1-\alpha/2}$.
-   - When uncertainty spikes across all assets, gross portfolio exposure drops into cash instead of renormalizing to 1.5x leverage.
-4. **RMT Numerical Stability**:
-   - Eigenvalues clipped at $1e-8$; matrix operations scoped in `with np.errstate(...)`.
-   - Positive definiteness and condition number guaranteed via Ledoit-Wolf shrinkage; zero NaNs/infs.
-5. **Discrete AC & CVD Modulation**:
-   - AC generates discrete slices at interval $\tau$.
-   - Urgency $\kappa$ throttles when CVD detects passive limit absorption, and accelerates on trend momentum.
-6. **SQLite WAL Hygiene**:
-   - Zero-await transaction boundaries strictly enforced.
-   - Read cursors eagerly drained; periodic WAL checkpointing callable via `checkpoint_wal()`.
-7. **Point-in-Time Filtration**:
-   - `HistoricalDataLoader` includes formal temporal filtration assertions ($I_t \subset \mathcal{F}_t$).
-8. **Regression Suite**:
-   - 100% pass rate on all existing and new unit tests (target: $\ge 38$ tests).
+1. **Cycle Money Awareness**: Total authorized capital across all orders in any single cycle never exceeds $95\%$ of available cash, verified in test suite.
+2. **Conviction-Weighted Capital Distribution**: When multiple candidates qualify, capital is allocated proportional to their Kelly conviction score rather than FIFO starvation.
+3. **Progressive Exposure Governance**: Risk per trade dynamically adjusts between $0.25\%$ (during drawdowns/losing streaks) and $1.0\%$ (during verified winning streaks).
+4. **Small-Account Viability**: Verified on simulated $\$1,000$ and $\$5,000$ accounts without share rounding errors or excessive concentration.
+5. **Full Regression Integrity**: All existing 70 tests pass + new portfolio allocation & progressive exposure test suites pass.

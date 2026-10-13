@@ -34,14 +34,14 @@ class PositionActionType(str, Enum):
 class OrderDirective:
     ticker: str
     side: OrderSide
-    shares: int
+    shares: int | float
     limit_price: float
     stop_loss_price: float
     dollar_allocation: float
     risk_pct_actual: float
     is_authorized: bool
     rejection_reason: str | None = None
-    child_slices: list[int] = field(default_factory=list)
+    child_slices: list[int | float] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -62,7 +62,7 @@ class SliceRoutingType(str, Enum):
 
 @dataclass(frozen=True)
 class ChildSliceDirective:
-    shares: int
+    shares: int | float
     routing_type: SliceRoutingType
     fill_prob: float
     urgency_kappa: float
@@ -249,7 +249,7 @@ class AlmgrenChrissSlicer:
     @classmethod
     def slice_order(
         cls,
-        total_shares: int,
+        total_shares: int | float,
         price: float,
         adv: float = 10_000_000.0,
         max_pov_pct: float = 0.05,
@@ -257,10 +257,17 @@ class AlmgrenChrissSlicer:
         volatility: float = 0.02,
         cvd_divergence: float = 0.0,
         side: OrderSide = OrderSide.BUY
-    ) -> list[int]:
+    ) -> list[int | float]:
         """Slices parent orders into discrete child orders with CVD-modulated urgency."""
-        total_usd = total_shares * price
+        total_usd = float(total_shares) * float(price)
         if total_usd < threshold_usd or total_shares <= 10:
+            return [total_shares]
+
+        # Step 3: Almgren-Chriss Retail Execution Bypass
+        # For retail-sized orders (< 1% of 5-minute ADV), bypass slicing to avoid spread crossing drag
+        # 78 five-minute periods in regular trading hours (6.5 hours)
+        adv_5m_shares = max(100.0, (float(adv) / max(float(price), 1.0)) / 78.0)
+        if float(total_shares) < 0.01 * adv_5m_shares:
             return [total_shares]
 
         daily_shares = max(adv / max(price, 1.0), 1000.0)
@@ -290,7 +297,7 @@ class AlmgrenChrissSlicer:
     @classmethod
     def route_child_slices(
         cls,
-        total_shares: int,
+        total_shares: int | float,
         price: float,
         adv: float = 10_000_000.0,
         max_pov_pct: float = 0.05,
@@ -461,6 +468,492 @@ def allocate_portfolio_with_cash_preservation(
     return result
 
 
+@dataclass
+class TradeOutcome:
+    pnl: float
+    r_multiple: float
+    is_win: bool
+    timestamp: float = field(default_factory=time.time)
+
+
+class ProgressiveExposureTracker:
+    """Goverdhan 'Gon' Gajjala / Mark Minervini Progressive Exposure Risk Governor.
+    
+    Dynamically modulates the risk budget ceiling R_eff = R_base * M_prog across 3 regimes:
+    1. Contraction (Defensive): >= 2 consecutive losses or win rate < 25% -> M_prog = 0.50
+    2. Neutral: Baseline conditions -> M_prog = 1.00
+    3. Expansion (Offensive): >= 2 consecutive wins with avg win >= 2.0R AND market uptrend -> M_prog = 1.50
+    
+    Hard invariant: Single-position Kelly fraction kappa is strictly capped at kappa_max = 0.25 (Quarter-Kelly)
+    to prevent hyper-Kelly geometric decay (f > f*).
+    """
+
+    def __init__(
+        self,
+        base_risk_pct: float = 0.005,  # 0.5% base risk per trade
+        max_multiplier: float = 1.50,   # Expansion ceiling: 0.75%
+        min_multiplier: float = 0.50,   # Contraction floor: 0.25%
+        window_size: int = 10,
+        kappa_max: float = 0.25
+    ):
+        self.base_risk_pct = base_risk_pct
+        self.max_multiplier = max_multiplier
+        self.min_multiplier = min_multiplier
+        self.window_size = window_size
+        self.kappa_max = kappa_max
+        self.trade_history: deque[TradeOutcome] = deque(maxlen=window_size)
+        self.consecutive_wins = 0
+        self.consecutive_losses = 0
+
+    def record_trade_outcome(self, pnl: float, r_multiple: float) -> None:
+        """Records a closed trade's PnL and R-multiple."""
+        is_win = (float(pnl) > 0.0 or float(r_multiple) > 0.0)
+        outcome = TradeOutcome(pnl=float(pnl), r_multiple=float(r_multiple), is_win=is_win)
+        self.trade_history.append(outcome)
+        if is_win:
+            self.consecutive_wins += 1
+            self.consecutive_losses = 0
+        else:
+            self.consecutive_losses += 1
+            self.consecutive_wins = 0
+
+    def compute_risk_multiplier(self, market_uptrend: bool = True) -> float:
+        """Computes M_prog based on trailing performance and market index filter."""
+        if len(self.trade_history) == 0:
+            return 1.0
+
+        # Contraction check: >= 2 consecutive losses
+        if self.consecutive_losses >= 2:
+            return self.min_multiplier
+
+        # Rolling win rate check across rolling window (if >= 4 trades)
+        if len(self.trade_history) >= 4:
+            wins = sum(1 for t in self.trade_history if t.is_win)
+            win_rate = float(wins) / float(len(self.trade_history))
+            if win_rate < 0.25:
+                return self.min_multiplier
+
+        # Expansion check: >= 2 consecutive wins, avg win >= 2.0R, and confirmed market uptrend (SPY > 21 EMA)
+        if self.consecutive_wins >= 2 and market_uptrend:
+            recent_wins = [t.r_multiple for t in self.trade_history if t.is_win]
+            if recent_wins and (sum(recent_wins) / float(len(recent_wins))) >= 2.0:
+                return self.max_multiplier
+
+        return 1.0
+
+    def get_effective_risk_pct(self, market_uptrend: bool = True) -> float:
+        """Returns R_eff = R_base * M_prog."""
+        multiplier = self.compute_risk_multiplier(market_uptrend=market_uptrend)
+        return float(self.base_risk_pct * multiplier)
+
+    def get_effective_kappa(self, requested_kappa: float = 0.15) -> float:
+        """Strictly caps Kelly fraction at Quarter-Kelly (kappa <= 0.25) to avoid geometric ruin."""
+        return float(min(requested_kappa, self.kappa_max))
+
+
+@dataclass
+class CandidateIntent:
+    ticker: str
+    price: float
+    atr: float
+    stop_dist: float
+    action: int = 2
+    debate_confidence: float = 0.5
+    sortino_ratio: float = 1.0
+    returns: np.ndarray | list[float] | None = None
+    cvd_divergence: float = 0.0
+    evt_var_99: float = 0.0
+    conformal_residuals: np.ndarray | None = None
+
+
+@dataclass(frozen=True)
+class BatchAllocationResult:
+    authorized_directives: list[OrderDirective]
+    rejected_directives: list[OrderDirective]
+    total_allocated_capital: float
+    cash_pool: float
+    weights: dict[str, float]
+    selected_tickers: list[str]
+
+
+class PortfolioCapitalAllocator:
+    """Multi-Asset Covariance Kelly & Small-Account Cardinality-Constrained Allocator.
+    
+    Implements:
+    1. Small-account cardinality constraints (K <= 2 for < $5k, K <= 3 for < $10k).
+    2. Conviction ranking based on debate consensus confidence and Sortino ratio.
+    3. Multi-Asset Covariance Kelly Vector allocation solving F^* = kappa * Sigma_LW^-1 * M.
+    4. Ledoit-Wolf RMT covariance shrinkage ensuring strictly well-conditioned positive definiteness.
+    5. Global Cash Pool ceiling: sum(Capital_i) <= Available Cash * 0.95 (Zero cash overdraw).
+    6. Dual Constraint Position Sizing: min(Capital_i / Price_i, Equity * R_eff / StopDist_i).
+    7. Fractional share precision down to 0.001 shares for small accounts.
+    """
+
+    def __init__(self, governor: RiskGovernor):
+        self.governor = governor
+
+    def allocate_batch_directives(
+        self,
+        candidates: list[CandidateIntent],
+        portfolio_equity: float,
+        available_cash: float,
+        current_positions_count: int = 0,
+        held_tickers: set[str] | list[str] | None = None,
+        circuit_breaker_active: bool = False,
+        market_uptrend: bool = True,
+        allow_fractional: bool = True
+    ) -> BatchAllocationResult:
+        """Batch evaluate candidate intents with Multi-Asset Kelly & cash conservation."""
+        held_set = set(held_tickers) if held_tickers else set()
+        auth_directives: list[OrderDirective] = []
+        rej_directives: list[OrderDirective] = []
+        weights_dict: dict[str, float] = {}
+
+        if not candidates:
+            return BatchAllocationResult([], [], 0.0, max(0.0, available_cash * 0.95), {}, [])
+
+        # 1. Systemic Circuit Breaker & Safety Checks
+        if circuit_breaker_active:
+            for c in candidates:
+                rej_directives.append(OrderDirective(
+                    ticker=c.ticker,
+                    side=OrderSide.HOLD,
+                    shares=0,
+                    limit_price=c.price,
+                    stop_loss_price=0.0,
+                    dollar_allocation=0.0,
+                    risk_pct_actual=0.0,
+                    is_authorized=False,
+                    rejection_reason="Circuit breaker active (daily drawdown halt)"
+                ))
+            return BatchAllocationResult([], rej_directives, 0.0, max(0.0, available_cash * 0.95), {}, [])
+
+        otr_safe, otr_msg = self.governor.otr_tracker.check_safety()
+        if not otr_safe:
+            for c in candidates:
+                rej_directives.append(OrderDirective(
+                    ticker=c.ticker,
+                    side=OrderSide.HOLD,
+                    shares=0,
+                    limit_price=c.price,
+                    stop_loss_price=0.0,
+                    dollar_allocation=0.0,
+                    risk_pct_actual=0.0,
+                    is_authorized=False,
+                    rejection_reason=otr_msg or "OTR Kill-Switch engaged"
+                ))
+            return BatchAllocationResult([], rej_directives, 0.0, max(0.0, available_cash * 0.95), {}, [])
+
+        if available_cash <= 0.0:
+            for c in candidates:
+                rej_directives.append(OrderDirective(
+                    ticker=c.ticker,
+                    side=OrderSide.HOLD,
+                    shares=0,
+                    limit_price=c.price,
+                    stop_loss_price=0.0,
+                    dollar_allocation=0.0,
+                    risk_pct_actual=0.0,
+                    is_authorized=False,
+                    rejection_reason="Available cash is zero or negative"
+                ))
+            return BatchAllocationResult([], rej_directives, 0.0, 0.0, {}, [])
+
+        # 2. Determine Small-Account Maximum Cardinality K
+        cfg_max = getattr(self.governor.cfg, "max_concurrent_positions", 5)
+        if portfolio_equity < 5000.0:
+            max_k = min(2, cfg_max)
+        elif portfolio_equity < 10000.0:
+            max_k = min(3, cfg_max)
+        else:
+            max_k = cfg_max
+
+        slots_available = max(0, max_k - current_positions_count)
+        if slots_available == 0:
+            for c in candidates:
+                rej_directives.append(OrderDirective(
+                    ticker=c.ticker,
+                    side=OrderSide.HOLD,
+                    shares=0,
+                    limit_price=c.price,
+                    stop_loss_price=0.0,
+                    dollar_allocation=0.0,
+                    risk_pct_actual=0.0,
+                    is_authorized=False,
+                    rejection_reason=f"Max concurrent positions reached ({max_k}) for account equity tier"
+                ))
+            return BatchAllocationResult([], rej_directives, 0.0, max(0.0, available_cash * 0.95), {}, [])
+
+        # 3. Categorize candidates (EXIT, HOLD, ALREADY HELD, BUY)
+        eligible_buys: list[CandidateIntent] = []
+        for c in candidates:
+            if c.ticker in held_set:
+                rej_directives.append(OrderDirective(
+                    ticker=c.ticker,
+                    side=OrderSide.HOLD,
+                    shares=0,
+                    limit_price=c.price,
+                    stop_loss_price=0.0,
+                    dollar_allocation=0.0,
+                    risk_pct_actual=0.0,
+                    is_authorized=False,
+                    rejection_reason=f"Position in {c.ticker} is already open"
+                ))
+            elif c.action == 0:
+                rej_directives.append(OrderDirective(
+                    ticker=c.ticker,
+                    side=OrderSide.HOLD,
+                    shares=0,
+                    limit_price=c.price,
+                    stop_loss_price=0.0,
+                    dollar_allocation=0.0,
+                    risk_pct_actual=0.0,
+                    is_authorized=False,
+                    rejection_reason="Action is HOLD"
+                ))
+            elif c.action == 3:
+                # Early EXIT directive
+                self.governor.otr_tracker.record_order(price=c.price, ltp=c.price)
+                auth_directives.append(OrderDirective(
+                    ticker=c.ticker,
+                    side=OrderSide.SELL,
+                    shares=0,
+                    limit_price=c.price,
+                    stop_loss_price=0.0,
+                    dollar_allocation=0.0,
+                    risk_pct_actual=0.0,
+                    is_authorized=True,
+                    rejection_reason=None
+                ))
+            elif c.action in (1, 2) and c.price > 0:
+                eligible_buys.append(c)
+            else:
+                rej_directives.append(OrderDirective(
+                    ticker=c.ticker,
+                    side=OrderSide.HOLD,
+                    shares=0,
+                    limit_price=c.price,
+                    stop_loss_price=0.0,
+                    dollar_allocation=0.0,
+                    risk_pct_actual=0.0,
+                    is_authorized=False,
+                    rejection_reason="Invalid price or action"
+                ))
+
+        if not eligible_buys:
+            return BatchAllocationResult(auth_directives, rej_directives, 0.0, max(0.0, available_cash * 0.95), {}, [])
+
+        # 4. Rank Candidates by Conviction Score S_i = debate_confidence * Sortino
+        def get_conviction_score(item: CandidateIntent) -> float:
+            act_mult = 0.75 if item.action == 1 else 1.0
+            return float(item.debate_confidence * max(0.1, item.sortino_ratio) * act_mult)
+
+        eligible_buys.sort(key=get_conviction_score, reverse=True)
+
+        selected = eligible_buys[:slots_available]
+        dropped = eligible_buys[slots_available:]
+        for d in dropped:
+            rej_directives.append(OrderDirective(
+                ticker=d.ticker,
+                side=OrderSide.HOLD,
+                shares=0,
+                limit_price=d.price,
+                stop_loss_price=0.0,
+                dollar_allocation=0.0,
+                risk_pct_actual=0.0,
+                is_authorized=False,
+                rejection_reason=f"Dropped by portfolio cardinality ranking (lower conviction score than top {slots_available})"
+            ))
+
+        # 5. Multi-Asset Covariance Kelly Vector Allocation
+        m_assets = len(selected)
+        cfg_kappa = getattr(self.governor.cfg, "kelly_fraction", 0.15)
+        kappa = self.governor.progressive_tracker.get_effective_kappa(cfg_kappa)
+
+        m_vec = []
+        for c in selected:
+            if c.returns is not None and len(c.returns) >= 5:
+                m_vec.append(max(0.001, float(np.mean(c.returns))))
+            else:
+                m_vec.append(0.01 * max(0.5, float(c.debate_confidence)))
+        m_vec = np.array(m_vec, dtype=np.float64)
+
+        # Build Covariance Matrix (RMT Ledoit-Wolf or Regularized Diagonal)
+        can_compute_rmt = False
+        try:
+            from features.quant_theories import QuantTheoryEngine
+        except ImportError:
+            QuantTheoryEngine = None
+
+        if QuantTheoryEngine is not None and m_assets >= 2:
+            all_returns = [c.returns for c in selected if c.returns is not None]
+            if len(all_returns) == m_assets:
+                min_len = min(len(r) for r in all_returns)
+                if min_len >= 10:
+                    try:
+                        R = np.column_stack([np.asarray(c.returns[:min_len], dtype=np.float64) for c in selected])
+                        shrunk_corr, _, _ = QuantTheoryEngine.clean_correlation_rmt(R, dynamic_shrinkage=True)
+                        stds = np.std(R, axis=0, ddof=0)
+                        stds[stds < 1e-4] = 1e-4
+                        D = np.diag(stds)
+                        cov_matrix = D @ shrunk_corr @ D
+                        can_compute_rmt = True
+                    except Exception:
+                        can_compute_rmt = False
+
+        if not can_compute_rmt:
+            stds = []
+            for c in selected:
+                if c.returns is not None and len(c.returns) >= 5:
+                    stds.append(max(1e-4, float(np.std(c.returns))))
+                else:
+                    stds.append(max(1e-4, float(c.atr / max(c.price, 1.0))))
+            stds = np.array(stds, dtype=np.float64)
+            cov_matrix = np.diag(stds ** 2)
+
+        reg_cov = cov_matrix + 1e-6 * np.eye(m_assets)
+        try:
+            f_star = np.linalg.pinv(reg_cov) @ (kappa * m_vec)
+            # Long-only constraint: enforce [0.02, 0.25] floor so selected assets are not starved by cross-correlation
+            f_star = np.clip(f_star, 0.02, 0.25)
+        except Exception:
+            f_star = np.full(m_assets, 0.20)
+
+        if np.sum(f_star) <= 1e-6:
+            scores = np.array([get_conviction_score(c) for c in selected], dtype=np.float64)
+            if np.sum(scores) > 0:
+                weights = scores / np.sum(scores)
+            else:
+                weights = np.full(m_assets, 1.0 / m_assets)
+        else:
+            weights = f_star / np.sum(f_star)
+
+        # 6. Global Cash Pool & Dual Constraint Sizing
+        cash_pool = float(available_cash * 0.95)
+        r_eff = self.governor.progressive_tracker.get_effective_risk_pct(market_uptrend=market_uptrend)
+
+        raw_allocated = []
+        for idx, c in enumerate(selected):
+            w_i = float(weights[idx])
+            cap_i = min(w_i * cash_pool, portfolio_equity * 0.25)
+
+            action_scale = 0.5 if c.action == 1 else 1.0
+            c_risk = r_eff * action_scale
+            if c.evt_var_99 > 0.05:
+                c_risk *= 0.65
+
+            dollar_risk = portfolio_equity * c_risk
+            stop_dist = max(c.stop_dist, c.price * 0.01)
+
+            shares_risk = dollar_risk / stop_dist
+            shares_cap = cap_i / c.price if c.price > 0 else 0.0
+            target_shares = min(shares_risk, shares_cap)
+            stop_loss_price = max(0.01, c.price - stop_dist)
+
+            raw_allocated.append({
+                "candidate": c,
+                "target_shares": target_shares,
+                "stop_loss_price": stop_loss_price,
+                "weight": w_i
+            })
+
+        # Global Cash Ceiling Invariant: sum(Shares_i * Price_i) <= Cash_Pool
+        total_needed = sum(item["target_shares"] * item["candidate"].price for item in raw_allocated)
+        if total_needed > cash_pool and total_needed > 0:
+            scale_factor = cash_pool / total_needed
+            for item in raw_allocated:
+                item["target_shares"] *= scale_factor
+
+        total_capital = 0.0
+        selected_tickers = [c.ticker for c in selected]
+
+        for item in raw_allocated:
+            c = item["candidate"]
+            s = item["target_shares"]
+            w = item["weight"]
+            weights_dict[c.ticker] = round(w, 4)
+
+            if allow_fractional or portfolio_equity < 10000.0 or s < 1.0:
+                shares = round(s, 3)
+                if shares < 0.001:
+                    shares = 0.0
+            else:
+                shares = int(s)
+
+            if shares <= 0:
+                rej_directives.append(OrderDirective(
+                    ticker=c.ticker,
+                    side=OrderSide.HOLD,
+                    shares=0,
+                    limit_price=c.price,
+                    stop_loss_price=round(item["stop_loss_price"], 2),
+                    dollar_allocation=0.0,
+                    risk_pct_actual=0.0,
+                    is_authorized=False,
+                    rejection_reason="Share sizing rounded to 0 under capital/cash constraints"
+                ))
+                continue
+
+            dollar_alloc = round(float(shares * c.price), 2)
+            if total_capital + dollar_alloc > cash_pool:
+                remaining_cash = max(0.0, cash_pool - total_capital)
+                if allow_fractional:
+                    shares = round(remaining_cash / c.price, 3)
+                    if shares < 0.001:
+                        shares = 0.0
+                else:
+                    shares = int(remaining_cash / c.price)
+                dollar_alloc = round(float(shares * c.price), 2)
+                if shares <= 0:
+                    rej_directives.append(OrderDirective(
+                        ticker=c.ticker,
+                        side=OrderSide.HOLD,
+                        shares=0,
+                        limit_price=c.price,
+                        stop_loss_price=round(item["stop_loss_price"], 2),
+                        dollar_allocation=0.0,
+                        risk_pct_actual=0.0,
+                        is_authorized=False,
+                        rejection_reason="Capital pool exhausted by higher-conviction assets"
+                    ))
+                    continue
+
+            actual_risk_pct = round(float((shares * (c.price - item["stop_loss_price"])) / portfolio_equity), 4) if portfolio_equity > 0 else 0.0
+
+            child_slices = self.governor.slicer.slice_order(
+                shares,
+                c.price,
+                adv=self.governor.cfg.min_avg_daily_volume_usd,
+                cvd_divergence=c.cvd_divergence,
+                side=OrderSide.BUY
+            )
+
+            self.governor.otr_tracker.record_order(price=c.price, ltp=c.price)
+
+            auth_directives.append(OrderDirective(
+                ticker=c.ticker,
+                side=OrderSide.BUY,
+                shares=shares,
+                limit_price=c.price,
+                stop_loss_price=round(item["stop_loss_price"], 2),
+                dollar_allocation=dollar_alloc,
+                risk_pct_actual=actual_risk_pct,
+                is_authorized=True,
+                rejection_reason=None,
+                child_slices=child_slices
+            ))
+            total_capital += dollar_alloc
+
+        return BatchAllocationResult(
+            authorized_directives=auth_directives,
+            rejected_directives=rej_directives,
+            total_allocated_capital=round(total_capital, 2),
+            cash_pool=round(cash_pool, 2),
+            weights=weights_dict,
+            selected_tickers=selected_tickers
+        )
+
+
 class RiskGovernor:
     """Mathematical gatekeeper authorizing, sizing, or rejecting trade orders."""
 
@@ -473,6 +966,37 @@ class RiskGovernor:
             proximity_delta=getattr(risk_cfg, "otr_proximity_delta", 0.0075)
         )
         self.slicer = AlmgrenChrissSlicer()
+        self.progressive_tracker = ProgressiveExposureTracker(
+            base_risk_pct=getattr(risk_cfg, "base_risk_per_trade", 0.005)
+        )
+        self.allocator = PortfolioCapitalAllocator(self)
+
+    def evaluate_batch(
+        self,
+        candidates: list[CandidateIntent],
+        portfolio_equity: float,
+        available_cash: float,
+        current_positions_count: int = 0,
+        held_tickers: set[str] | list[str] | None = None,
+        circuit_breaker_active: bool = False,
+        market_uptrend: bool = True
+    ) -> BatchAllocationResult:
+        """Batch evaluate candidate intents with Multi-Asset Kelly & cash conservation."""
+        allow_fractional = getattr(self.cfg, "allow_fractional_shares", True)
+        return self.allocator.allocate_batch_directives(
+            candidates=candidates,
+            portfolio_equity=portfolio_equity,
+            available_cash=available_cash,
+            current_positions_count=current_positions_count,
+            held_tickers=held_tickers,
+            circuit_breaker_active=circuit_breaker_active,
+            market_uptrend=market_uptrend,
+            allow_fractional=allow_fractional
+        )
+
+    def record_trade_outcome(self, pnl: float, r_multiple: float) -> None:
+        """Feeds a completed trade outcome to the progressive exposure tracker."""
+        self.progressive_tracker.record_trade_outcome(pnl=pnl, r_multiple=r_multiple)
 
     def evaluate_order(
         self,
@@ -605,7 +1129,14 @@ class RiskGovernor:
         stop_loss_price = max(0.01, current_price - stop_dist)
 
         # Shares to risk exact dollar budget
-        raw_shares = int(dollar_risk / stop_dist)
+        allow_fractional = getattr(self.cfg, "allow_fractional_shares", True)
+        if allow_fractional and (portfolio_equity < 10000.0 or (dollar_risk / stop_dist) < 1.0):
+            raw_shares = round(dollar_risk / stop_dist, 3)
+            if raw_shares < 0.001:
+                raw_shares = 0.0
+        else:
+            raw_shares = int(dollar_risk / stop_dist)
+
         if raw_shares <= 0:
             return OrderDirective(
                 ticker=ticker,
@@ -651,8 +1182,14 @@ class RiskGovernor:
         else:
             max_capital_for_pos = min(portfolio_equity * 0.20, available_cash * 0.95)
 
-        max_shares_capital = int(max_capital_for_pos / current_price) if current_price > 0 else 0
+        if allow_fractional and (portfolio_equity < 10000.0 or (max_capital_for_pos / current_price) < 1.0):
+            max_shares_capital = round(max_capital_for_pos / current_price, 3) if current_price > 0 else 0.0
+        else:
+            max_shares_capital = int(max_capital_for_pos / current_price) if current_price > 0 else 0
+
         final_shares = min(raw_shares, max_shares_capital)
+        if isinstance(final_shares, float):
+            final_shares = round(final_shares, 3)
 
         if final_shares <= 0:
             return OrderDirective(

@@ -47,6 +47,9 @@ class RiskConfig:
     otr_proximity_delta: float = 0.0075    # SEBI/NSE proximity exemption (+-0.75% of LTP)
     conformal_alpha: float = 0.20          # Conformal prediction miscoverage rate (80% coverage)
     conformal_z_score: float = 1.2816      # Standard normal quantile for alpha=0.20
+    allow_fractional_shares: bool = True   # Enable fractional execution for small-account capital efficiency
+    max_cardinality_small_account: int = 2 # Max simultaneous positions for micro-accounts (< $5,000)
+    base_risk_per_trade: float = 0.005     # 0.5% base risk budget per trade (progressive ceiling: 0.25% - 0.75%)
 
 
 @dataclass(frozen=True)
@@ -121,6 +124,9 @@ def load_config(env_path: str | Path | None = None) -> Config:
         max_risk_per_trade=float(os.getenv("MAX_RISK_PER_TRADE", 0.015)),
         daily_drawdown_limit=float(os.getenv("DAILY_DRAWDOWN_LIMIT", 0.03)),
         atr_multiplier_stop=float(os.getenv("ATR_MULTIPLIER_STOP", 2.0)),
+        allow_fractional_shares=os.getenv("ALLOW_FRACTIONAL_SHARES", "true").lower() in ("true", "1", "yes"),
+        max_cardinality_small_account=int(os.getenv("MAX_CARDINALITY_SMALL_ACCOUNT", 2)),
+        base_risk_per_trade=float(os.getenv("BASE_RISK_PER_TRADE", 0.005)),
     )
 
     model_cfg = ModelConfig(

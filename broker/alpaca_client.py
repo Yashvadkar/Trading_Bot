@@ -27,7 +27,7 @@ class AccountStatus:
 @dataclass(frozen=True)
 class PositionInfo:
     ticker: str
-    shares: int
+    shares: int | float
     current_price: float
     market_value: float
     unrealized_pnl: float
@@ -40,7 +40,7 @@ class ExecutionResult:
     order_id: str | None
     ticker: str
     side: str
-    shares: int
+    shares: int | float
     filled_price: float
     message: str
 
@@ -233,12 +233,72 @@ class AlpacaPaperClient:
 
         # 1. Buy Order with Stop-Loss & Take-Profit (Bracket)
         if directive.side == OrderSide.BUY:
+            is_fractional = isinstance(directive.shares, float) and (directive.shares % 1.0 != 0.0 or directive.shares < 1.0)
+            qty_str = f"{directive.shares:.3f}" if is_fractional else str(int(directive.shares))
+
+            if is_fractional:
+                # Alpaca restriction: fractional orders cannot use bracket/stop-loss order classes.
+                # Submit as simple market day order. Software RiskGovernor manages stop-loss trailing.
+                payload = {
+                    "symbol": directive.ticker,
+                    "qty": qty_str,
+                    "side": "buy",
+                    "type": "market",
+                    "time_in_force": "day",
+                    "client_order_id": client_order_id
+                }
+                try:
+                    resp = self.session.post(f"{self.base_url}/v2/orders", json=payload, timeout=10)
+                    if resp.status_code in (200, 201):
+                        res_data = resp.json()
+                        return ExecutionResult(
+                            success=True,
+                            order_id=res_data.get("id"),
+                            ticker=directive.ticker,
+                            side="buy",
+                            shares=directive.shares,
+                            filled_price=directive.limit_price,
+                            message=f"Fractional market buy order submitted to Alpaca (Key: {client_order_id})."
+                        )
+                    else:
+                        return ExecutionResult(
+                            success=False,
+                            order_id=None,
+                            ticker=directive.ticker,
+                            side="buy",
+                            shares=directive.shares,
+                            filled_price=directive.limit_price,
+                            message=f"Alpaca API error: {resp.status_code} - {resp.text}"
+                        )
+                except (requests.Timeout, requests.RequestException) as net_err:
+                    print(f"[Alpaca Gateway] Network partition/timeout on {client_order_id}. Reconciling exchange state...")
+                    reconciled = self.get_order_by_client_id(client_order_id)
+                    if reconciled and reconciled.get("status") in ("accepted", "new", "partially_filled", "filled", "pending_new"):
+                        return ExecutionResult(
+                            success=True,
+                            order_id=reconciled.get("id"),
+                            ticker=directive.ticker,
+                            side="buy",
+                            shares=directive.shares,
+                            filled_price=directive.limit_price,
+                            message=f"Order reconciled via client_order_id ({client_order_id}) after network timeout."
+                        )
+                    return ExecutionResult(
+                        success=False,
+                        order_id=None,
+                        ticker=directive.ticker,
+                        side="buy",
+                        shares=0,
+                        filled_price=0.0,
+                        message=f"Order timed out and was not confirmed at exchange boundary: {net_err}"
+                    )
+
             stop_dist = max(0.5, directive.limit_price - directive.stop_loss_price)
             take_profit_price = round(directive.limit_price + (2.5 * stop_dist), 2)
 
             payload = {
                 "symbol": directive.ticker,
-                "qty": str(directive.shares),
+                "qty": qty_str,
                 "side": "buy",
                 "type": "market",
                 "time_in_force": "day",
@@ -258,7 +318,7 @@ class AlpacaPaperClient:
                     # Fallback to OTO (One-Triggers-Other) with stop-loss only if bracket is rejected
                     payload_oto = {
                         "symbol": directive.ticker,
-                        "qty": str(directive.shares),
+                        "qty": qty_str,
                         "side": "buy",
                         "type": "market",
                         "time_in_force": "day",

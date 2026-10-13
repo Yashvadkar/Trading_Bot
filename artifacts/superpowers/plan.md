@@ -1,124 +1,148 @@
-# Superpowers Implementation Plan — 4th Institutional Audit Remediation
+# Superpowers Implementation Plan: Money-Aware Portfolio Capital Allocation, Small-Account Viability & Kronos/Championship Integration
 
 ## Goal
-Remediate all vulnerabilities and architectural blockers identified in the 4th Deep Research Institutional Audit of `Trading_Bot` (advancing Production-Readiness from 7.5/10 to 9.8/10):
-1. **Blocker: Asynchronous Persistence** — Eliminate WAL checkpoint starvation by removing PASSIVE checkpoints from the synchronous write path and introducing a dedicated background daemon executing periodic `PRAGMA wal_checkpoint(RESTART);` with clean process lifecycle management.
-2. **Major: Monotonic SSE Sequence Gating** — Implement ULID lexicographical sorting and Last-Write-Wins (CRDT) sequence gating in `OrderLifecycleFSM` to prevent non-deterministic, out-of-order thread pool Alpaca Activity SSE events from overwriting terminal states.
-3. **Major: Survivorship Bias Elimination** — Enhance Point-in-Time (PIT) filtration by mapping both `CONSTITUENT_INCEPTION` and `CONSTITUENT_DELISTING` to evaluate the boolean window $t \in [t_{inception}, t_{delisting})$, mathematically preventing historical lookahead and survivorship contamination.
-4. **Minor: Microstructural Execution** — Dynamically recalculate Almgren-Chriss remaining urgency parameter $\kappa$ and temporary impact penalty $\tilde{\eta}$ whenever Cont-Larrard queue fill probability ($P_{\text{fill}} < 0.40$) triggers an aggressive market sweep.
-5. **Nit: Spectral Stability** — Implement analytical dynamic Ledoit-Wolf shrinkage based on the Frobenius norm minimization to optimally bound the correlation condition number during market stress regimes.
-6. **Master Verification**: Expand the regression suite ($\ge 64$ tests) and execute live autonomous dry-run cycle without warnings or regressions.
+Implement mathematically rigorous portfolio cash awareness, Multi-Asset Covariance Kelly allocation using our existing Ledoit-Wolf shrunken covariance matrix ($\Sigma_{\text{LW}}^{-1} M$), Goverdhan "Gon" Gajjala's championship risk framework (+805% 2023 US Investing Champion), small-account cardinality constraints with fractional share execution, an Almgren-Chriss retail bypass gate, and architectural foundations for the `Kronos` K-line Foundation Model (`shiyu-coder/Kronos`).
 
 ---
 
 ## Assumptions
-1. **Target Directory**: All modifications reside within `c:/Users/YASH/AIGaming/Trading_Bot/`.
-2. **Baseline Stability**: All 59 existing unit tests must continue to pass cleanly without regression.
-3. **Ponytail Standard**: Zero unneeded external dependencies; solutions leverage native Python `threading`, standard library SQLite, and memory-contiguous NumPy structures.
-4. **Broker Protocol**: Full compliance with Alpaca v2 REST and WebSocket Activity Streams (`v2beta1/events/activities`).
+1. **Capital Conservation**: Total capital allocated across all orders in any scan cycle must strictly satisfy $\sum_{i=1}^K \text{Capital}_i \le \text{Available Cash} \times 0.95$.
+2. **True Multi-Asset Covariance Kelly**: Asset allocation must account for cross-asset correlation using the Ledoit-Wolf shrunken covariance matrix $\Sigma_{\text{LW}}^{-1} M$ rather than heuristic univariate water-filling sums.
+3. **Conformal Risk-Constrained Sizing (No Hyper-Kelly Ruin)**: Progressive exposure adjusts the fixed risk-per-trade budget ceiling $R \in [0.25\%, 0.75\%]$ and conformal uncertainty intervals, NEVER scaling Kelly fractions into the hyper-Kelly geometric decay regime ($f > f^*$).
+4. **Small-Account Cardinality & Fractional Execution**: For accounts under $\$10,000$, cardinality is strictly capped at $K \in [1, 3]$ positions to eliminate micro-account spread drag and fee compounding, using Alpaca fractional shares (down to $0.001$ shares).
+5. **Almgren-Chriss Retail Bypass**: For orders $< 0.01 \times \text{ADV}_{5\text{m}}$, bypass hyperbolic order slicing to avoid artificial spread crossings; route via direct marketable limit orders.
+6. **Zero Regressions**: All 70 existing unit tests must remain 100% passing.
 
 ---
 
 ## Plan
 
-### Step 1: Dedicated WAL Checkpoint Daemon & Starvation Elimination
+### Step 1: Conformal & Progressive Risk Governor in `risk/governor.py`
 - **Files**:
-  - `Trading_Bot/broker/ledger.py`
-  - `Trading_Bot/tests/test_ledger_wal.py`
+  - `risk/governor.py`
+  - `tests/test_progressive_exposure.py`
 - **Change**:
-  - In `broker/ledger.py`:
-    - Remove `PRAGMA wal_checkpoint(PASSIVE);` from the latency-sensitive write path inside `_sync_batch_write`.
-    - Implement a dedicated background daemon `_start_checkpoint_daemon(interval_sec=300)` running a dedicated thread that executes `PRAGMA wal_checkpoint(RESTART);` periodically.
-    - Implement `stop_checkpoint_daemon()` using a `threading.Event` to ensure clean shutdown without thread leaks.
-    - Ensure `checkpoint_wal(mode="RESTART")` can be called explicitly at trading cycle conclusion or application exit.
+  - Create `ProgressiveExposureTracker` inside `risk/governor.py`:
+    - Tracks recent closed trades ($N=10$) with fields: `pnl`, `r_multiple`, `is_win`.
+    - Computes safe risk budget ceiling $R_{\text{eff}} = R_{\text{base}} \times \mathcal{M}_{\text{prog}}$:
+      - **Contraction Mode**: If $\ge 2$ consecutive losses or rolling win rate $< 25\%$, $\mathcal{M}_{\text{prog}} = 0.50$ (slashes base risk from $0.50\%$ to $0.25\%$).
+      - **Neutral Mode**: $\mathcal{M}_{\text{prog}} = 1.0$ (base risk $0.50\%$).
+      - **Expansion Mode**: If $\ge 2$ consecutive wins with average win $\ge 2.0R$ and market in confirmed uptrend (SPY > 21 EMA), $\mathcal{M}_{\text{prog}} = 1.50$ (scales risk ceiling to $0.75\%$).
+    - Prevents hyper-Kelly geometric ruin by capping single-position Kelly fraction at $\kappa_{\max} = 0.25$ (Quarter-Kelly).
+  - Add unit tests verifying streak contraction, expansion limits, and risk ceiling enforcement.
 - **Verify**:
-  - `python -m unittest tests/test_ledger_wal.py` verifying daemon checkpointing, clean thread termination, and RESTART truncation.
+  - `python -m unittest tests/test_progressive_exposure.py`
 
-### Step 2: Monotonic ULID-Based SSE Sequence Gating in Order Lifecycle FSM
+---
+
+### Step 2: Multi-Asset Covariance Kelly & Cardinality-Constrained Allocator in `risk/governor.py`
 - **Files**:
-  - `Trading_Bot/broker/order_fsm.py`
-  - `Trading_Bot/broker/alpaca_client.py`
-  - `Trading_Bot/tests/test_order_fsm.py`
+  - `risk/governor.py`
+  - `tests/test_portfolio_allocator.py`
 - **Change**:
-  - In `broker/order_fsm.py`:
-    - Add `last_event_id: str | None = None` to `OrderStateRecord`.
-    - Implement `process_sse_event(client_order_id: str, new_state: OrderState, event_id: str, filled_qty: int = 0) -> bool`:
-      - Validates lexicographical ULID ordering: if `event_id <= record.last_event_id`, discards stale/duplicate events.
-      - Enforces terminal immutability: if record is already in a terminal state (`FILLED`, `CANCELED`, `REJECTED`), discards any delayed active state transitions (e.g. out-of-order `PARTIALLY_FILLED`).
-      - Updates `record.last_event_id = event_id` monotonically.
-  - In `broker/alpaca_client.py`:
-    - Wire WebSocket/SSE event handlers to pass the incoming event ULID through `process_sse_event()`.
+  - Create `PortfolioCapitalAllocator` in `risk/governor.py`:
+    - Method `allocate_batch_directives(candidates, portfolio_equity, available_cash, returns_matrix, progressive_mult)`:
+      - Accepts list of candidate evaluation intents (ticker, price, ATR, stop_dist, debate_confidence).
+      - **Small-Account Cardinality Constraint**:
+        $$K = \min(\text{max\_concurrent}, \begin{cases} 2 & \text{if } \text{Equity} < \$5,000 \\ 3 & \text{if } \$5,000 \le \text{Equity} < \$10,000 \\ \text{max\_concurrent} & \text{otherwise} \end{cases})$$
+      - Ranks candidates by conviction score $S_i = \text{confidence}_i \times \text{Sortino}_i$. Selects top $K$ candidates.
+      - **Multi-Asset Covariance Kelly Vector**:
+        Computes Ledoit-Wolf shrunken covariance matrix $\Sigma_{\text{LW}}$ across candidate returns.
+        Solves $F^* = \kappa \cdot \Sigma_{\text{LW}}^{-1} M$, clipped to $[0.0, 0.25]$ per asset.
+      - Normalizes weights across top $K$ candidates: $w_i = \frac{F_i^*}{\sum_{j=1}^K F_j^*}$.
+      - Global Cash Pool: $C_{\text{pool}} = \text{available\_cash} \times 0.95$.
+      - Individual Target Capital: $\text{Cap}_i = \min(w_i \cdot C_{\text{pool}}, \text{portfolio\_equity} \cdot 0.25)$.
+      - Dual Constraint Position Sizing:
+        $$\text{Shares}_i = \min\left(\frac{\text{Cap}_i}{P_i}, \frac{\text{Equity} \cdot R_{\text{eff}}}{\text{StopDist}_i}\right)$$
+      - Strictly guarantees $\sum_{i=1}^K (\text{Shares}_i \cdot P_i) \le C_{\text{pool}}$ without FIFO starvation.
 - **Verify**:
-  - `python -m unittest tests/test_order_fsm.py` asserting that delayed SSE messages with older event IDs or terminal reversions are rejected.
+  - `python -m unittest tests/test_portfolio_allocator.py`
 
-### Step 3: Survivorship Bias Mitigation via Delisting Filtration
-- **Files**:
-  - `Trading_Bot/data/historical_loader.py`
-  - `Trading_Bot/tests/test_pit_filtration.py`
-- **Change**:
-  - In `data/historical_loader.py`:
-    - Add `CONSTITUENT_DELISTING: dict[str, str | None]` mapping constituent termination dates alongside `CONSTITUENT_INCEPTION`.
-    - Include representative historical delisted assets (e.g., `TWTR`: "2022-10-27", `BBBY`: "2023-05-03", `LEHM`: "2008-09-15").
-    - Implement `is_constituent_tradable(ticker: str, as_of_date: str) -> bool` asserting $t \in [t_{\text{inception}}, t_{\text{delisting}})$.
-    - Update `build_historical_replay_buffer()` and screener to enforce that delisted tickers cannot generate signals or execute trades after their delisting date, eliminating Class I survivorship contamination.
-- **Verify**:
-  - `python -m unittest tests/test_pit_filtration.py` asserting that queries evaluated after delisting dates return `False` and reject state vector generation.
+---
 
-### Step 4: Almgren-Chriss Dynamic Urgency Recalculation on Aggressive Sweeps
+### Step 3: Almgren-Chriss Retail Execution Bypass & Fractional Share Routing
 - **Files**:
-  - `Trading_Bot/risk/governor.py`
-  - `Trading_Bot/tests/test_institutional_risk.py`
+  - `risk/governor.py`
+  - `broker/alpaca_client.py`
+  - `tests/test_small_account_sizing.py`
 - **Change**:
   - In `risk/governor.py`:
-    - In `AlmgrenChrissSlicer`:
-      - Implement `recalculate_urgency_on_spread_crossing(current_urgency: float, spread_penalty: float = 0.25) -> float`:
-        $$\tilde{\eta}_{\text{adj}} = \tilde{\eta} \cdot (1 + \text{spread\_penalty}), \quad \kappa_{\text{adj}} = \sqrt{\frac{\lambda \sigma^2}{\tilde{\eta}_{\text{adj}}}}$$
-      - When Cont-Larrard queue probability ($P_{\text{fill}} < 0.40$) triggers an `AGGRESSIVE_MARKET` sweep, dynamically adjust the remaining inventory urgency $\kappa$ to prevent shortfall variance runaway.
-      - Update `route_child_slices()` to output the recalibrated urgency for subsequent slices.
+    - In `AlmgrenChrissSlicer`: add volume threshold bypass:
+      ```python
+      if order_shares < 0.01 * (adv_5m or 100_000):
+          # Retail-sized order: bypass slicing, single direct block to avoid spread drag
+          return [order_shares]
+      ```
+    - Support fractional shares when `shares < 1.0` or `portfolio_equity < 10000.0`:
+      `shares = round(shares, 3)` instead of `int(shares)`.
+  - In `broker/alpaca_client.py`:
+    - Format `qty=f"{directive.shares:.3f}"` in Alpaca REST payload when `shares` is a float.
+  - Add unit tests verifying small accounts (\$1,000) can buy fractional quantities without rounding to 0.
 - **Verify**:
-  - `python -m unittest tests/test_institutional_risk.py` asserting that aggressive sweeps trigger urgency damping for remaining child orders.
+  - `python -m unittest tests/test_small_account_sizing.py`
 
-### Step 5: Dynamic Frobenius-Norm Ledoit-Wolf Linear Shrinkage
-- **Files**:
-  - `Trading_Bot/features/quant_theories.py`
-  - `Trading_Bot/tests/test_quant_theories.py`
-- **Change**:
-  - In `features/quant_theories.py`:
-    - In `QuantTheoryEngine.clean_correlation_rmt()`:
-      - Add dynamic Ledoit-Wolf intensity calculation:
-        $$\alpha^* = \text{clip}\left(\frac{\sum_{i \ne j} \text{Var}(r_{ij})}{\|C_{\text{clean}} - I\|_F^2}, 0.01, 0.40\right)$$
-      - Apply dynamic shrinkage when `dynamic_shrinkage=True`, using static $\alpha = 0.05$ as a calibrated baseline.
-      - Ensures the condition number is optimally minimized during severe market crises and volatility shocks.
-- **Verify**:
-  - `python -m unittest tests/test_quant_theories.py` asserting that dynamic shrinkage minimizes condition number across synthetic high-stress market matrices.
+---
 
-### Step 6: Master Bot Integration, Full Discovery & Dry-Run Cycle
+### Step 4: Deterministic Intraday VCP Pattern Detector in `screening/screener.py`
 - **Files**:
-  - `Trading_Bot/bot.py`
-  - `Trading_Bot/main.py`
+  - `screening/screener.py`
+  - `features/indicators.py`
+  - `tests/test_vcp_screener.py`
 - **Change**:
-  - In `TradingBot.__init__`: start the ledger WAL checkpoint daemon on startup and register graceful daemon shutdown on cycle/application exit.
-  - Wire ULID sequence gating into broker event handlers and integrate dynamic urgency tracking into child order routing.
-  - Execute full test discovery across all test modules (target: $\ge 64$ passing tests).
-  - Execute autonomous live dry-run cycle verifying clean execution and zero warnings.
+  - Implement programmatic Volatility Contraction Pattern (VCP) detection:
+    - Peak & trough detection via progressive swing depth $D_1 > D_2 > D_3$.
+    - Volume dry-up condition: final contraction volume $< 0.50 \times \text{SMA}(V, 50)$.
+    - Intraday moving average perfect order: $\text{Price} > \text{EMA}(9) > \text{EMA}(21)$.
+    - Expose `detect_intraday_vcp(bars_df) -> tuple[bool, float]` returning `(is_vcp, contraction_ratio)`.
 - **Verify**:
+  - `python -m unittest tests/test_vcp_screener.py`
+
+---
+
+### Step 5: Wire Two-Stage Batch Arena, Broker Feedback & Kronos Adapter in `bot.py`
+- **Files**:
+  - `bot.py`
+  - `config.py`
+  - `tests/test_pipeline.py`
+- **Change**:
+  - In `config.py`: Add `allow_fractional_shares: bool = True`, `max_cardinality_small_account: int = 2`, `base_risk_per_trade: float = 0.005`.
+  - In `bot.py` (`TradingBot.run_cycle()`):
+    - Replace the individual FIFO loop with a clean Two-Stage Batch Pipeline:
+      1. **Debate Stage**: Run Neural Debate Arena across all screened stocks, collecting approved candidate signals.
+      2. **Portfolio Allocation Stage**: Pass all approved candidates to `self.governor.allocator.allocate_batch_directives()` with multi-asset covariance matrix.
+      3. **Execution Stage**: Iterate over allocated directives, route via retail bypass / Alpaca broker.
+    - Wire trade outcome feedback from `TradeLedger` into `self.governor.progressive_tracker`.
+    - Provide structural interface/stub for `KronosPredictor` foundation model embeddings (`model/kronos_adapter.py`).
+- **Verify**:
+  - `python -m unittest tests/test_pipeline.py`
   - `python -m unittest discover -s tests -p "test_*.py"`
-  - `python main.py --cycles 1 --dry-run`
+
+---
+
+### Step 6: Master Regression & Multi-Scale Autonomous Simulation
+- **Files**:
+  - Full test suite
+  - `main.py`
+- **Change**:
+  - Run full discovery test suite: `python -m unittest discover -s tests -p "test_*.py"` (target $> 78$ tests passing).
+  - Run dry-run cycle on simulated small account (\$1,000) and standard account (\$100,000):
+    `python main.py --cycles 1 --dry-run`
+  - Update `artifacts/superpowers/execution.md`, `review.md`, and `finish.md`.
+- **Verify**:
+  - Zero capital overdraw ($\sum \text{Allocated} \le 0.95 \times \text{Cash}$).
+  - Small accounts successfully execute fractional positions with max 2 concurrent holdings.
 
 ---
 
 ## Risks & Mitigations
-
-| Risk | Impact | Mitigation |
-| :--- | :--- | :--- |
-| **Checkpoint Thread Blocking** | RESTART checkpoint hangs if a rogue reader holds an open cursor. | Bound the connection timeout to 10.0s and catch `sqlite3.OperationalError` safely; continue next cycle. |
-| **ULID Sorting Edge Cases** | Malformed or empty event IDs could silently reject valid updates. | Fallback to timestamp comparison if event ID is missing or not a valid ULID. |
-| **Delisting Lookahead False Positives** | Assets incorrectly excluded if delisting timestamp timezone does not match UTC. | Standardize all inception and delisting timestamps strictly to ISO-8601 UTC. |
-| **Dynamic Shrinkage Denominator Zero** | $\|C - I\|_F^2$ near zero if correlation matrix is already identity. | Enforce minimum epsilon $10^{-8}$ in denominator and clip $\alpha^*$ to $[0.01, 0.40]$. |
+| Risk | Severity | Mitigation |
+|---|---|---|
+| Illiquid tickers rejecting fractional orders | Medium | Alpaca client checks `is_fractionable` or falls back to nearest valid share quantity. |
+| Inverting ill-conditioned covariance matrix in multi-asset Kelly | High | Guaranteed well-conditioned inversion via already-integrated Ledoit-Wolf shrinkage ($\Sigma_{\text{LW}}^{-1}$). |
+| Streak expansion causing drawdown in choppy market | High | Exposure expansion requires confirmed market index trend ($\text{SPY} > 21\text{ EMA}$) and is capped at Quarter-Kelly ($\kappa = 0.25$). |
 
 ---
 
 ## Rollback Plan
-If any step introduces instability:
-1. Revert specific modified module via `git checkout -- <file>`.
-2. Existing 59 unit tests serve as the baseline; verify with `python -m unittest discover -s tests -p "test_*.py"`.
+- All changes managed in Git.
+- If regression occurs, `git restore` reverts to working commit `2ae8cd5`.
