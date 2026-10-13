@@ -5,6 +5,8 @@ and extracts historical OHLCV data using yfinance with resilient caching.
 """
 
 from __future__ import annotations
+import concurrent.futures
+import time
 from dataclasses import dataclass
 import numpy as np
 import yfinance as yf
@@ -31,8 +33,11 @@ class ScreenedStock:
 class QuantitativeScreener:
     """Screening gatekeeper filtering out illiquid or penny-stock traps."""
 
-    def __init__(self, risk_cfg: RiskConfig):
+    def __init__(self, risk_cfg: RiskConfig, cache_ttl_sec: float = 60.0):
         self.risk_cfg = risk_cfg
+        self.cache_ttl_sec = cache_ttl_sec
+        self._stock_cache: dict[str, tuple[float, ScreenedStock]] = {}
+        self._earnings_cache: dict[str, tuple[float, bool, int | None, str | None]] = {}
 
     def check_earnings_embargo(
         self,
@@ -42,8 +47,17 @@ class QuantitativeScreener:
         """Checks if company earnings release is scheduled within days_embargo (48h).
         
         Hard filter to protect small accounts against overnight 20-30% binary earnings gap events.
+        Cached with 1-hour TTL to eliminate redundant Yahoo Finance calls.
         Returns (is_embargoed, days_until, message).
         """
+        sym = getattr(ticker_obj, "ticker", "")
+        now_ts = time.time()
+        if isinstance(sym, str) and sym and sym in self._earnings_cache:
+            ts, emb, days, msg = self._earnings_cache[sym]
+            if (now_ts - ts) < 3600.0:  # 1 hour TTL
+                return emb, days, msg
+
+        res_emb, res_days, res_msg = False, None, None
         try:
             cal = getattr(ticker_obj, "calendar", None)
             if cal is not None:
@@ -67,13 +81,25 @@ class QuantitativeScreener:
                             continue
                         delta = (target_date - now).days
                         if 0 <= delta <= days_embargo:
-                            return True, delta, f"Binary earnings event scheduled in {delta} days (within {days_embargo}d embargo)"
+                            res_emb = True
+                            res_days = delta
+                            res_msg = f"Binary earnings event scheduled in {delta} days (within {days_embargo}d embargo)"
+                            break
         except Exception:
             pass
-        return False, None, None
+
+        if isinstance(sym, str) and sym:
+            self._earnings_cache[sym] = (now_ts, res_emb, res_days, res_msg)
+        return res_emb, res_days, res_msg
 
     def screen_ticker(self, ticker: str) -> ScreenedStock | None:
         """Fetch market data via yfinance and evaluate quantitative health filters."""
+        now = time.time()
+        if ticker in self._stock_cache:
+            ts, cached_stock = self._stock_cache[ticker]
+            if (now - ts) < self.cache_ttl_sec:
+                return cached_stock
+
         try:
             ticker_obj = yf.Ticker(ticker)
             # Fetch 6 months of daily historical OHLCV
@@ -139,7 +165,7 @@ class QuantitativeScreener:
 
             is_vcp, vcp_ratio, _ = detect_volatility_contraction_pattern(highs, lows, closes, volumes)
 
-            return ScreenedStock(
+            stock = ScreenedStock(
                 ticker=ticker,
                 price=current_price,
                 market_cap=market_cap,
@@ -152,17 +178,34 @@ class QuantitativeScreener:
                 vcp_ratio=vcp_ratio,
                 rejection_reason=rejection,
             )
+            self._stock_cache[ticker] = (now, stock)
+            return stock
 
         except Exception as e:
             return None
 
-    def screen_batch(self, tickers: list[str]) -> list[ScreenedStock]:
-        """Screen a list of discovered tickers, returning only liquid candidates."""
+    def screen_batch(self, tickers: list[str], max_workers: int = 8) -> list[ScreenedStock]:
+        """Screen a list of discovered tickers concurrently, returning only liquid candidates."""
+        if not tickers:
+            return []
+        if len(tickers) == 1:
+            stock = self.screen_ticker(tickers[0])
+            return [stock] if (stock and stock.is_liquid) else []
+
         approved: list[ScreenedStock] = []
-        for sym in tickers:
-            stock = self.screen_ticker(sym)
-            if stock and stock.is_liquid:
-                approved.append(stock)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(max_workers, len(tickers))) as executor:
+            future_to_sym = {executor.submit(self.screen_ticker, sym): sym for sym in tickers}
+            for fut in concurrent.futures.as_completed(future_to_sym):
+                try:
+                    stock = fut.result()
+                    if stock and stock.is_liquid:
+                        approved.append(stock)
+                except Exception:
+                    pass
+
+        # Maintain deterministic input order
+        order_map = {sym: i for i, sym in enumerate(tickers)}
+        approved.sort(key=lambda s: order_map.get(s.ticker, 999))
         return approved
 
     def filter_vcp_candidates(self, stocks: list[ScreenedStock]) -> list[ScreenedStock]:

@@ -116,12 +116,22 @@ def run_daemon_loop(bot: TradingBot, config: Config, interval: int) -> None:
         if clock.is_open:
             trained_off_hours_today = False  # Reset for next close
             print(f"\n[Daemon] Market is OPEN. Executing Cycle #{cycle_count}...")
+            cycle_start = time.time()
             bot.run_cycle()
+            cycle_duration = time.time() - cycle_start
 
-            # Sleep between cycles during market hours
-            sleep_remaining = interval
+            # Candle-aligned or drift-compensated sleep cadence
+            if interval >= 60:
+                # Align to top-of-minute candle boundaries (:00s)
+                next_boundary = (int(time.time()) // interval + 1) * interval
+                sleep_needed = max(1.0, float(next_boundary - time.time()))
+            else:
+                sleep_needed = max(0.5, float(interval - cycle_duration))
+
+            print(f"[Daemon] Cycle duration: {cycle_duration:.2f}s | Target sleep: {sleep_needed:.1f}s")
+            sleep_remaining = sleep_needed
             while sleep_remaining > 0 and not stop_requested:
-                step = min(1, sleep_remaining)
+                step = min(1.0, sleep_remaining)
                 time.sleep(step)
                 sleep_remaining -= step
         else:

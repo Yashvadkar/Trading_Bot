@@ -98,6 +98,7 @@ class TestVCPScreener(unittest.TestCase):
 
         # Mock ticker with earnings date 1 day from now
         mock_ticker = MagicMock()
+        mock_ticker.ticker = "EARN_SOON"
         tomorrow = datetime.date.today() + datetime.timedelta(days=1)
         mock_ticker.calendar = {"Earnings Date": [tomorrow]}
 
@@ -107,13 +108,60 @@ class TestVCPScreener(unittest.TestCase):
         self.assertIn("Binary earnings event scheduled in 1 days", msg)
 
         # Mock ticker with earnings date 10 days from now (safe)
+        mock_safe_ticker = MagicMock()
+        mock_safe_ticker.ticker = "EARN_SAFE"
         ten_days = datetime.date.today() + datetime.timedelta(days=10)
-        mock_ticker.calendar = {"Earnings Date": [ten_days]}
-        embargoed, days, msg = screener.check_earnings_embargo(mock_ticker, days_embargo=2)
+        mock_safe_ticker.calendar = {"Earnings Date": [ten_days]}
+        embargoed, days, msg = screener.check_earnings_embargo(mock_safe_ticker, days_embargo=2)
         self.assertFalse(embargoed)
         self.assertIsNone(days)
+
+    def test_screen_batch_parallel_and_caching(self):
+        from unittest.mock import patch
+        screener = QuantitativeScreener(RiskConfig(), cache_ttl_sec=60.0)
+
+        # Mock screen_ticker to test parallel dispatcher and caching
+        call_counts = {"AAPL": 0, "MSFT": 0, "NVDA": 0}
+
+        def mock_screen(sym):
+            call_counts[sym] += 1
+            from features.indicators import TechnicalMetrics
+            from features.normalizer import FundamentalMetrics, MicrostructureMetrics
+            dummy_tech = TechnicalMetrics(50, 0, 0, 0, 1, 0.01, 0, 0, 0, 0.5, 0.2, 1.0)
+            dummy_fund = FundamentalMetrics(1e9, 20, 0.5, 0.1, 0.1, 1.0)
+            dummy_micro = MicrostructureMetrics(0.001, 0, 0.99, 1.0)
+            return ScreenedStock(sym, 100.0, 1e9, 2e7, dummy_tech, dummy_fund, dummy_micro, True)
+
+        with patch.object(screener, "screen_ticker", side_effect=mock_screen):
+            results = screener.screen_batch(["AAPL", "MSFT", "NVDA"])
+            self.assertEqual(len(results), 3)
+            # Must preserve deterministic input ordering
+            self.assertEqual([s.ticker for s in results], ["AAPL", "MSFT", "NVDA"])
+            self.assertEqual(call_counts["AAPL"], 1)
+            self.assertEqual(call_counts["MSFT"], 1)
+            self.assertEqual(call_counts["NVDA"], 1)
+
+    def test_in_memory_stock_caching(self):
+        screener = QuantitativeScreener(RiskConfig(), cache_ttl_sec=60.0)
+        from features.indicators import TechnicalMetrics
+        from features.normalizer import FundamentalMetrics, MicrostructureMetrics
+        dummy_tech = TechnicalMetrics(50, 0, 0, 0, 1, 0.01, 0, 0, 0, 0.5, 0.2, 1.0)
+        dummy_fund = FundamentalMetrics(1e9, 20, 0.5, 0.1, 0.1, 1.0)
+        dummy_micro = MicrostructureMetrics(0.001, 0, 0.99, 1.0)
+        cached_stock = ScreenedStock("CACHED_SYM", 150.0, 1e9, 2e7, dummy_tech, dummy_fund, dummy_micro, True)
+        
+        # Populate cache manually
+        import time
+        screener._stock_cache["CACHED_SYM"] = (time.time(), cached_stock)
+        
+        # Calling screen_ticker must return cached stock instantly without querying yfinance
+        stock = screener.screen_ticker("CACHED_SYM")
+        self.assertIsNotNone(stock)
+        self.assertEqual(stock.ticker, "CACHED_SYM")
+        self.assertEqual(stock.price, 150.0)
 
 
 if __name__ == "__main__":
     unittest.main()
+
 
