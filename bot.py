@@ -178,8 +178,15 @@ class TradingBot:
                         current_stop_price=base_stop
                     )
 
-                    if pos_directive.action_type == PositionActionType.EXIT:
-                        print(f"[Position Monitor: EXIT TRIGGERED] {pos.ticker} - {pos_directive.reason}")
+                    # Marcos López de Prado Triple Barrier evaluation (Profit, Stop, and Time-decay)
+                    tb_exit, tb_reason = self.governor.triple_barrier_tracker.evaluate_bar(pos.ticker, pos.current_price)
+                    syn_exit, syn_reason = self.governor.synthetic_stop_monitor.evaluate_tick(pos.ticker, pos.current_price)
+
+                    should_exit = (pos_directive.action_type == PositionActionType.EXIT) or tb_exit or syn_exit
+                    exit_reason = pos_directive.reason or tb_reason or syn_reason
+
+                    if should_exit:
+                        print(f"[Position Monitor: EXIT TRIGGERED] {pos.ticker} - {exit_reason}")
                         exit_res = self.broker.submit_order(OrderDirective(
                             ticker=pos.ticker,
                             side=OrderSide.SELL,
@@ -192,12 +199,15 @@ class TradingBot:
                         ))
                         if exit_res.success:
                             print(f"[Broker: EXIT SUCCESS] Closed position in {pos.ticker}")
+                            self.governor.triple_barrier_tracker.unregister(pos.ticker)
+                            self.governor.synthetic_stop_monitor.unregister_position(pos.ticker)
                             r_mult = float(pos.unrealized_pnl_pct / (2.0 * stock_data.technicals.atr / pos.current_price)) if stock_data.technicals.atr > 0 and pos.current_price > 0 else 0.0
                             self.governor.record_trade_outcome(pnl=pos.unrealized_pnl, r_multiple=r_mult)
                     elif pos_directive.action_type == PositionActionType.UPDATE_STOP:
                         print(f"[Position Monitor: RATCHET STOP] {pos.ticker} - {pos_directive.reason}")
                         updated = self.broker.update_stop_loss(pos.ticker, pos_directive.new_stop_price)
                         if updated:
+                            self.governor.synthetic_stop_monitor.update_stop_loss(pos.ticker, pos_directive.new_stop_price)
                             print(f"[Broker: STOP UPDATED] {pos.ticker} stop ratcheted to ${pos_directive.new_stop_price:.2f}")
                     else:
                         print(f"[Position Monitor: HOLD] {pos.ticker} ({pos.shares} shs @ ${pos.current_price:.2f}, PnL: {pos.unrealized_pnl_pct*100:+.2f}%)")
@@ -309,7 +319,8 @@ class TradingBot:
             current_positions_count=len(positions),
             held_tickers=held_tickers,
             circuit_breaker_active=(breaker_state.status != BreakerStatus.NORMAL),
-            market_uptrend=True
+            market_uptrend=True,
+            settled_cash=getattr(account, "cash", None)
         )
 
         print(
@@ -347,6 +358,19 @@ class TradingBot:
             if res.success:
                 executed_count += 1
                 self.governor.otr_tracker.record_trade()
+                if directive.side == OrderSide.BUY:
+                    self.governor.synthetic_stop_monitor.register_position(
+                        ticker=directive.ticker,
+                        entry_price=directive.limit_price,
+                        stop_loss_price=directive.stop_loss_price
+                    )
+                    self.governor.triple_barrier_tracker.register(
+                        ticker=directive.ticker,
+                        entry_price=directive.limit_price,
+                        stop_loss_price=directive.stop_loss_price,
+                        take_profit_price=round(directive.limit_price + 2.5 * max(0.5, directive.limit_price - directive.stop_loss_price), 2),
+                        max_bars=15
+                    )
                 print(f"[Broker: SUCCESS] {res.message} (Order ID: {res.order_id})")
                 self.ledger.log_trade(TradeRecord(
                     ticker=directive.ticker,

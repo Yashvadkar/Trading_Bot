@@ -156,5 +156,44 @@ class TestPortfolioAllocator(unittest.TestCase):
         self.assertEqual(auth_sides["NEW_BUY"], OrderSide.BUY)
 
 
+    def test_constrained_kelly_qp_solver(self):
+        # Correlated covariance matrix across 3 assets
+        cov = np.array([
+            [0.04, 0.02, 0.01],
+            [0.02, 0.09, 0.02],
+            [0.01, 0.02, 0.06]
+        ])
+        m = np.array([0.05, 0.08, 0.04])
+        weights = PortfolioCapitalAllocator.solve_constrained_kelly(
+            cov=cov,
+            kappa=0.25,
+            m_vec=m,
+            min_weight=0.02,
+            max_weight=0.25,
+            max_total=1.0
+        )
+        self.assertEqual(len(weights), 3)
+        for w in weights:
+            self.assertGreaterEqual(w, 0.02 - 1e-6)
+            self.assertLessEqual(w, 0.25 + 1e-6)
+        self.assertLessEqual(np.sum(weights), 1.0 + 1e-6)
+
+    def test_settled_cash_pool_capping(self):
+        candidates = [
+            CandidateIntent(ticker="NVDA", price=100.0, atr=2.0, stop_dist=4.0, debate_confidence=0.9, sortino_ratio=2.5),
+        ]
+        # Available cash is $10,000, but settled cash is only $2,000
+        res = self.allocator.allocate_batch_directives(
+            candidates=candidates,
+            portfolio_equity=10_000.0,
+            available_cash=10_000.0,
+            settled_cash=2_000.0
+        )
+        # Cash pool must be capped at settled cash * 0.95 = $1,900.00
+        self.assertEqual(res.cash_pool, 2_000.0 * 0.95)
+        self.assertLessEqual(res.total_allocated_capital, 2_000.0 * 0.95)
+
+
 if __name__ == "__main__":
     unittest.main()
+

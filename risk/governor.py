@@ -592,6 +592,72 @@ class PortfolioCapitalAllocator:
     def __init__(self, governor: RiskGovernor):
         self.governor = governor
 
+    @staticmethod
+    def solve_constrained_kelly(
+        cov: np.ndarray,
+        kappa: float,
+        m_vec: np.ndarray,
+        min_weight: float = 0.02,
+        max_weight: float = 0.25,
+        max_total: float = 1.0
+    ) -> np.ndarray:
+        """Solves Box-and-Budget Constrained Quadratic Program for Multi-Asset Kelly:
+        
+        min_f  (1/2) f^T cov f - kappa * m^T f
+        s.t.   min_weight <= f_i <= max_weight
+               sum(f_i) <= max_total
+               
+        Uses scipy.optimize.minimize (SLSQP) with exact analytical gradient.
+        Falls back to pure NumPy Projected Gradient Descent (PGD) with dual bisection.
+        """
+        n = len(m_vec)
+        if n == 0:
+            return np.array([], dtype=np.float64)
+        if n == 1:
+            return np.array([float(np.clip(kappa * m_vec[0] / max(cov[0, 0], 1e-6), min_weight, max_weight))], dtype=np.float64)
+
+        # 1. Primary: Scipy SLSQP with analytical gradient
+        try:
+            from scipy.optimize import minimize
+            def loss(f):
+                return 0.5 * float(f @ cov @ f) - float(kappa * np.dot(m_vec, f))
+            def jac(f):
+                return cov @ f - kappa * m_vec
+
+            bounds = [(min(min_weight, max_weight), max_weight) for _ in range(n)]
+            cons = [{'type': 'ineq', 'fun': lambda f: max_total - np.sum(f)}]
+            f0 = np.full(n, min(max_weight, max_total / n), dtype=np.float64)
+            res = minimize(loss, f0, jac=jac, bounds=bounds, constraints=cons, method='SLSQP')
+            if res.success and np.all(np.isfinite(res.x)):
+                return np.asarray(res.x, dtype=np.float64)
+        except Exception:
+            pass
+
+        # 2. Resilient Pure NumPy Projected Gradient Descent (PGD) fallback
+        f = np.full(n, min(max_weight, max_total / n), dtype=np.float64)
+        L = float(np.linalg.norm(cov, ord=2))
+        step_size = 1.0 / max(L, 1e-4)
+
+        for _ in range(50):
+            grad = cov @ f - kappa * m_vec
+            f_next = f - step_size * grad
+            f_next = np.clip(f_next, min_weight, max_weight)
+            if np.sum(f_next) > max_total:
+                low, high = 0.0, float(np.max(f_next))
+                for _ in range(20):
+                    mid = (low + high) / 2.0
+                    f_proj = np.clip(f_next - mid, min_weight, max_weight)
+                    if np.sum(f_proj) > max_total:
+                        low = mid
+                    else:
+                        high = mid
+                f_next = np.clip(f_next - high, min_weight, max_weight)
+            if np.linalg.norm(f_next - f) < 1e-5:
+                break
+            f = f_next
+
+        return np.asarray(f, dtype=np.float64)
+
     def allocate_batch_directives(
         self,
         candidates: list[CandidateIntent],
@@ -601,7 +667,8 @@ class PortfolioCapitalAllocator:
         held_tickers: set[str] | list[str] | None = None,
         circuit_breaker_active: bool = False,
         market_uptrend: bool = True,
-        allow_fractional: bool = True
+        allow_fractional: bool = True,
+        settled_cash: float | None = None
     ) -> BatchAllocationResult:
         """Batch evaluate candidate intents with Multi-Asset Kelly & cash conservation."""
         held_set = set(held_tickers) if held_tickers else set()
@@ -812,12 +879,14 @@ class PortfolioCapitalAllocator:
             cov_matrix = np.diag(stds ** 2)
 
         reg_cov = cov_matrix + 1e-6 * np.eye(m_assets)
-        try:
-            f_star = np.linalg.pinv(reg_cov) @ (kappa * m_vec)
-            # Long-only constraint: enforce [0.02, 0.25] floor so selected assets are not starved by cross-correlation
-            f_star = np.clip(f_star, 0.02, 0.25)
-        except Exception:
-            f_star = np.full(m_assets, 0.20)
+        f_star = self.solve_constrained_kelly(
+            cov=reg_cov,
+            kappa=kappa,
+            m_vec=m_vec,
+            min_weight=0.02,
+            max_weight=0.25,
+            max_total=1.0
+        )
 
         if np.sum(f_star) <= 1e-6:
             scores = np.array([get_conviction_score(c) for c in selected], dtype=np.float64)
@@ -828,8 +897,11 @@ class PortfolioCapitalAllocator:
         else:
             weights = f_star / np.sum(f_star)
 
-        # 6. Global Cash Pool & Dual Constraint Sizing
-        cash_pool = float(available_cash * 0.95)
+        # 6. Global Cash Pool & Dual Constraint Sizing (Settled Cash Protected)
+        effective_cash = available_cash
+        if settled_cash is not None and settled_cash >= 0.0:
+            effective_cash = min(available_cash, float(settled_cash))
+        cash_pool = float(effective_cash * 0.95)
         r_eff = self.governor.progressive_tracker.get_effective_risk_pct(market_uptrend=market_uptrend)
 
         raw_allocated = []
@@ -954,6 +1026,138 @@ class PortfolioCapitalAllocator:
         )
 
 
+class SyntheticStopLossMonitor:
+    """Multi-tick wick-resistant synthetic stop-loss monitor for fractional positions.
+    
+    Protects micro-accounts from predatory HFT liquidity sweeps, anomalous exchange prints,
+    and single-tick flash whipsaws by requiring persistent breach confirmation.
+    """
+    def __init__(self, confirmation_ticks: int = 3):
+        self.confirmation_ticks = confirmation_ticks
+        self._positions: dict[str, dict] = {}
+
+    def register_position(self, ticker: str, entry_price: float, stop_loss_price: float) -> None:
+        self._positions[ticker] = {
+            "entry_price": float(entry_price),
+            "stop_loss_price": float(stop_loss_price),
+            "breaches": 0,
+            "highest_price": float(entry_price),
+            "triggered": False
+        }
+
+    def unregister_position(self, ticker: str) -> None:
+        self._positions.pop(ticker, None)
+
+    def update_stop_loss(self, ticker: str, new_stop_price: float) -> None:
+        if ticker in self._positions:
+            self._positions[ticker]["stop_loss_price"] = max(self._positions[ticker]["stop_loss_price"], float(new_stop_price))
+
+    def evaluate_tick(self, ticker: str, current_price: float) -> tuple[bool, str | None]:
+        """Evaluates price tick against synthetic stop loss with multi-tick persistence.
+        
+        Returns (is_triggered, reason).
+        """
+        pos = self._positions.get(ticker)
+        if not pos or pos.get("triggered", False):
+            return False, None
+
+        stop_loss = pos["stop_loss_price"]
+        price = float(current_price)
+        pos["highest_price"] = max(pos["highest_price"], price)
+
+        if price < stop_loss:
+            pos["breaches"] += 1
+            if pos["breaches"] >= self.confirmation_ticks:
+                pos["triggered"] = True
+                return True, f"Synthetic stop-loss confirmed: {pos['breaches']} consecutive ticks below ${stop_loss:.2f} (current ${price:.2f})"
+        else:
+            # Price recovered above stop loss -> reset breach count (HFT wick immunity)
+            pos["breaches"] = 0
+
+        return False, None
+
+
+@dataclass
+class BarrierState:
+    ticker: str
+    entry_price: float
+    stop_loss_price: float
+    take_profit_price: float
+    max_bars: int
+    bars_held: int = 0
+    consecutive_stop_breaches: int = 0
+    highest_price: float = 0.0
+
+
+class TripleBarrierTracker:
+    """Marcos López de Prado Triple Barrier Exit Engine.
+    
+    Tracks:
+    1. Upper Barrier: Dynamic Take-Profit (+2.5R)
+    2. Lower Barrier: Synthetic Stop-Loss (-1.0R with multi-tick wick filter)
+    3. Vertical Barrier: Time-decay expiration (T_max bars) to recycle stagnant capital.
+    """
+    def __init__(self, default_max_bars: int = 15, wick_confirmation_ticks: int = 3):
+        self.default_max_bars = default_max_bars
+        self.wick_confirmation_ticks = wick_confirmation_ticks
+        self._barriers: dict[str, BarrierState] = {}
+
+    def register(
+        self,
+        ticker: str,
+        entry_price: float,
+        stop_loss_price: float,
+        take_profit_price: float | None = None,
+        max_bars: int | None = None
+    ) -> None:
+        stop_dist = max(0.01, entry_price - stop_loss_price)
+        tp = take_profit_price if take_profit_price is not None else (entry_price + 2.5 * stop_dist)
+        bars = max_bars if max_bars is not None else self.default_max_bars
+        self._barriers[ticker] = BarrierState(
+            ticker=ticker,
+            entry_price=float(entry_price),
+            stop_loss_price=float(stop_loss_price),
+            take_profit_price=float(tp),
+            max_bars=bars,
+            bars_held=0,
+            consecutive_stop_breaches=0,
+            highest_price=float(entry_price)
+        )
+
+    def unregister(self, ticker: str) -> None:
+        self._barriers.pop(ticker, None)
+
+    def evaluate_bar(self, ticker: str, current_price: float) -> tuple[bool, str | None]:
+        """Evaluates price and holding duration against the 3 barriers.
+        
+        Returns (should_exit, exit_reason).
+        """
+        state = self._barriers.get(ticker)
+        if not state:
+            return False, None
+
+        state.bars_held += 1
+        state.highest_price = max(state.highest_price, current_price)
+
+        # 1. Upper Barrier (Take Profit)
+        if current_price >= state.take_profit_price:
+            return True, f"Triple Barrier: UPPER_PROFIT_BARRIER reached at ${current_price:.2f} >= ${state.take_profit_price:.2f}"
+
+        # 2. Lower Barrier (Stop Loss with Wick filter)
+        if current_price < state.stop_loss_price:
+            state.consecutive_stop_breaches += 1
+            if state.consecutive_stop_breaches >= self.wick_confirmation_ticks:
+                return True, f"Triple Barrier: LOWER_STOP_BARRIER breached ({state.consecutive_stop_breaches} ticks < ${state.stop_loss_price:.2f})"
+        else:
+            state.consecutive_stop_breaches = 0
+
+        # 3. Vertical Barrier (Time Expiration)
+        if state.bars_held >= state.max_bars:
+            return True, f"Triple Barrier: VERTICAL_TIME_BARRIER expired ({state.bars_held}/{state.max_bars} bars without resolution)"
+
+        return False, None
+
+
 class RiskGovernor:
     """Mathematical gatekeeper authorizing, sizing, or rejecting trade orders."""
 
@@ -970,6 +1174,13 @@ class RiskGovernor:
             base_risk_pct=getattr(risk_cfg, "base_risk_per_trade", 0.005)
         )
         self.allocator = PortfolioCapitalAllocator(self)
+        self.synthetic_stop_monitor = SyntheticStopLossMonitor(
+            confirmation_ticks=getattr(risk_cfg, "synthetic_stop_confirmation_ticks", 3)
+        )
+        self.triple_barrier_tracker = TripleBarrierTracker(
+            default_max_bars=getattr(risk_cfg, "triple_barrier_max_bars", 15),
+            wick_confirmation_ticks=getattr(risk_cfg, "synthetic_stop_confirmation_ticks", 3)
+        )
 
     def evaluate_batch(
         self,
@@ -979,7 +1190,8 @@ class RiskGovernor:
         current_positions_count: int = 0,
         held_tickers: set[str] | list[str] | None = None,
         circuit_breaker_active: bool = False,
-        market_uptrend: bool = True
+        market_uptrend: bool = True,
+        settled_cash: float | None = None
     ) -> BatchAllocationResult:
         """Batch evaluate candidate intents with Multi-Asset Kelly & cash conservation."""
         allow_fractional = getattr(self.cfg, "allow_fractional_shares", True)
@@ -991,7 +1203,8 @@ class RiskGovernor:
             held_tickers=held_tickers,
             circuit_breaker_active=circuit_breaker_active,
             market_uptrend=market_uptrend,
-            allow_fractional=allow_fractional
+            allow_fractional=allow_fractional,
+            settled_cash=settled_cash
         )
 
     def record_trade_outcome(self, pnl: float, r_multiple: float) -> None:

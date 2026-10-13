@@ -91,6 +91,29 @@ class TestVCPScreener(unittest.TestCase):
         self.assertEqual(len(vcp_list), 1)
         self.assertEqual(vcp_list[0].ticker, "VCP_STOCK")
 
+    def test_check_earnings_embargo(self):
+        import datetime
+        from unittest.mock import MagicMock
+        screener = QuantitativeScreener(RiskConfig())
+
+        # Mock ticker with earnings date 1 day from now
+        mock_ticker = MagicMock()
+        tomorrow = datetime.date.today() + datetime.timedelta(days=1)
+        mock_ticker.calendar = {"Earnings Date": [tomorrow]}
+
+        embargoed, days, msg = screener.check_earnings_embargo(mock_ticker, days_embargo=2)
+        self.assertTrue(embargoed)
+        self.assertEqual(days, 1)
+        self.assertIn("Binary earnings event scheduled in 1 days", msg)
+
+        # Mock ticker with earnings date 10 days from now (safe)
+        ten_days = datetime.date.today() + datetime.timedelta(days=10)
+        mock_ticker.calendar = {"Earnings Date": [ten_days]}
+        embargoed, days, msg = screener.check_earnings_embargo(mock_ticker, days_embargo=2)
+        self.assertFalse(embargoed)
+        self.assertIsNone(days)
+
 
 if __name__ == "__main__":
     unittest.main()
+

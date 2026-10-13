@@ -95,6 +95,21 @@ class TestAlpacaIdempotency(unittest.TestCase):
         self.assertIsNone(res.order_id)
         self.assertIn("Order timed out and was not confirmed", res.message)
 
+    def test_pre_trade_spread_guard_rejection(self):
+        # Bid = $99.00, Ask = $101.00 -> Spread = $2.00 / $100.00 = 2.0% > 0.30%
+        ok, spread, reason = self.client.check_pre_trade_spread("WIDE_STOCK", bid=99.0, ask=101.0)
+        self.assertFalse(ok)
+        self.assertAlmostEqual(spread, 0.02, places=4)
+        self.assertIn("exceeds max allowable threshold", reason)
+
+    def test_pre_trade_spread_guard_accepted(self):
+        # Bid = $100.00, Ask = $100.10 -> Spread = $0.10 / $100.05 = 0.099% < 0.30%
+        ok, spread, reason = self.client.check_pre_trade_spread("TIGHT_STOCK", bid=100.0, ask=100.10)
+        self.assertTrue(ok)
+        self.assertLess(spread, 0.003)
+        self.assertIsNone(reason)
+
 
 if __name__ == "__main__":
     unittest.main()
+

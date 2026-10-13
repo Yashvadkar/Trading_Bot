@@ -34,6 +34,44 @@ class QuantitativeScreener:
     def __init__(self, risk_cfg: RiskConfig):
         self.risk_cfg = risk_cfg
 
+    def check_earnings_embargo(
+        self,
+        ticker_obj: yf.Ticker,
+        days_embargo: int = 2
+    ) -> tuple[bool, int | None, str | None]:
+        """Checks if company earnings release is scheduled within days_embargo (48h).
+        
+        Hard filter to protect small accounts against overnight 20-30% binary earnings gap events.
+        Returns (is_embargoed, days_until, message).
+        """
+        try:
+            cal = getattr(ticker_obj, "calendar", None)
+            if cal is not None:
+                ed_list = None
+                if isinstance(cal, dict):
+                    ed_list = cal.get("Earnings Date")
+                elif hasattr(cal, "get"):
+                    ed_list = cal.get("Earnings Date")
+
+                if ed_list is not None:
+                    import datetime
+                    now = datetime.date.today()
+                    if not isinstance(ed_list, (list, tuple)):
+                        ed_list = [ed_list]
+                    for ed in ed_list:
+                        if hasattr(ed, "date"):
+                            target_date = ed.date()
+                        elif isinstance(ed, datetime.date):
+                            target_date = ed
+                        else:
+                            continue
+                        delta = (target_date - now).days
+                        if 0 <= delta <= days_embargo:
+                            return True, delta, f"Binary earnings event scheduled in {delta} days (within {days_embargo}d embargo)"
+        except Exception:
+            pass
+        return False, None, None
+
     def screen_ticker(self, ticker: str) -> ScreenedStock | None:
         """Fetch market data via yfinance and evaluate quantitative health filters."""
         try:
@@ -73,6 +111,11 @@ class QuantitativeScreener:
                 rejection = f"ADV ${adv_usd/1e6:.1f}M < ${self.risk_cfg.min_avg_daily_volume_usd/1e6:.1f}M floor"
             elif market_cap < self.risk_cfg.min_market_cap_usd:
                 rejection = f"Market Cap ${market_cap/1e6:.1f}M < ${self.risk_cfg.min_market_cap_usd/1e6:.1f}M floor"
+
+            # Earnings Embargo Check (Major remediation from Gemini Deep Research audit)
+            is_embargoed, days_to_earn, earn_msg = self.check_earnings_embargo(ticker_obj, days_embargo=2)
+            if is_embargoed and rejection is None:
+                rejection = f"Earnings embargo active: {earn_msg}"
 
             technicals = extract_technicals(opens, highs, lows, closes, volumes)
 

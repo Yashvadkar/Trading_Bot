@@ -56,9 +56,10 @@ class MarketClock:
 class AlpacaPaperClient:
     """REST Client for Alpaca Paper Trading API."""
 
-    def __init__(self, config: Config, dry_run: bool = False):
+    def __init__(self, config: Config, dry_run: bool = False, max_spread_pct: float = 0.003):
         self.config = config
         self.dry_run = dry_run
+        self.max_spread_pct = max_spread_pct
         self.fsm = OrderLifecycleFSM()
         self.base_url = config.alpaca_base_url.rstrip("/")
         self.headers = {
@@ -203,6 +204,49 @@ class AlpacaPaperClient:
         except Exception:
             return None
 
+    def get_latest_quote(self, ticker: str) -> tuple[float, float] | None:
+        """Fetches latest bid and ask price for ticker. Returns (bid, ask) or None."""
+        if self.dry_run:
+            return None
+        try:
+            resp = self.session.get(f"{self.base_url}/v2/stocks/{ticker}/quotes/latest", timeout=5)
+            if resp.status_code == 200:
+                q = resp.json().get("quote", {})
+                bid = float(q.get("bp", 0.0))
+                ask = float(q.get("ap", 0.0))
+                if bid > 0 and ask > 0:
+                    return bid, ask
+            return None
+        except Exception:
+            return None
+
+    def check_pre_trade_spread(
+        self,
+        ticker: str,
+        bid: float | None = None,
+        ask: float | None = None
+    ) -> tuple[bool, float, str | None]:
+        """Validates bid-ask spread before order submission.
+        
+        Relative spread = (ask - bid) / mid.
+        Returns (is_acceptable, spread_pct, reason).
+        """
+        if bid is None or ask is None or bid <= 0 or ask <= 0:
+            quote = self.get_latest_quote(ticker)
+            if quote:
+                bid, ask = quote
+            else:
+                return True, 0.0, None
+
+        mid = (bid + ask) / 2.0
+        if mid <= 0:
+            return True, 0.0, None
+
+        spread_pct = (ask - bid) / mid
+        if spread_pct > self.max_spread_pct:
+            return False, spread_pct, f"Pre-trade spread {spread_pct:.2%} exceeds max allowable threshold {self.max_spread_pct:.2%}"
+        return True, spread_pct, None
+
     def submit_order(self, directive: OrderDirective) -> ExecutionResult:
         """Submit a validated order directive to the broker with deterministic idempotency."""
         if not directive.is_authorized:
@@ -215,6 +259,20 @@ class AlpacaPaperClient:
                 filled_price=0.0,
                 message=f"Order rejected by risk governor: {directive.rejection_reason}"
             )
+
+        # Pre-Trade Spread Protection (Blocker remediation from Gemini Deep Research audit)
+        if directive.side == OrderSide.BUY and not self.dry_run:
+            spread_ok, spread_pct, spread_err = self.check_pre_trade_spread(directive.ticker)
+            if not spread_ok:
+                return ExecutionResult(
+                    success=False,
+                    order_id=None,
+                    ticker=directive.ticker,
+                    side=directive.side.value,
+                    shares=directive.shares,
+                    filled_price=0.0,
+                    message=f"Order rejected by pre-trade spread guard: {spread_err}"
+                )
 
         client_order_id = f"bot_{uuid.uuid4().hex[:16]}"
         self.fsm.register_order(client_order_id, initial_state=OrderState.PENDING_NEW)
@@ -231,7 +289,7 @@ class AlpacaPaperClient:
                 message=f"Simulated order accepted in dry-run mode (idempotency key: {client_order_id})."
             )
 
-        # 1. Buy Order with Stop-Loss & Take-Profit (Bracket)
+        # 1. Buy Order with Stop-Loss & Take-Profit (Bracket with Marketable Limit Protection)
         if directive.side == OrderSide.BUY:
             is_fractional = isinstance(directive.shares, float) and (directive.shares % 1.0 != 0.0 or directive.shares < 1.0)
             qty_str = f"{directive.shares:.3f}" if is_fractional else str(int(directive.shares))
@@ -295,12 +353,14 @@ class AlpacaPaperClient:
 
             stop_dist = max(0.5, directive.limit_price - directive.stop_loss_price)
             take_profit_price = round(directive.limit_price + (2.5 * stop_dist), 2)
+            marketable_limit = round(directive.limit_price * 1.0010, 2)
 
             payload = {
                 "symbol": directive.ticker,
                 "qty": qty_str,
                 "side": "buy",
-                "type": "market",
+                "type": "limit",
+                "limit_price": str(marketable_limit),
                 "time_in_force": "day",
                 "order_class": "bracket",
                 "client_order_id": client_order_id,
@@ -315,12 +375,20 @@ class AlpacaPaperClient:
             try:
                 resp = self.session.post(f"{self.base_url}/v2/orders", json=payload, timeout=10)
                 if resp.status_code not in (200, 201):
+                    # Fallback to market bracket or OTO with marketable limit
+                    payload_market = dict(payload)
+                    payload_market["type"] = "market"
+                    payload_market.pop("limit_price", None)
+                    resp = self.session.post(f"{self.base_url}/v2/orders", json=payload_market, timeout=10)
+
+                if resp.status_code not in (200, 201):
                     # Fallback to OTO (One-Triggers-Other) with stop-loss only if bracket is rejected
                     payload_oto = {
                         "symbol": directive.ticker,
                         "qty": qty_str,
                         "side": "buy",
-                        "type": "market",
+                        "type": "limit",
+                        "limit_price": str(marketable_limit),
                         "time_in_force": "day",
                         "order_class": "oto",
                         "client_order_id": client_order_id,
